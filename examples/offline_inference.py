@@ -14,6 +14,8 @@ from ucm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# 指定设备号
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 
 @contextlib.contextmanager
 def build_llm_with_uc(module_path: str, name: str, model: str):
@@ -22,7 +24,7 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
         kv_connector_module_path=module_path,
         kv_role="kv_both",
         kv_connector_extra_config={
-            "UCM_CONFIG_FILE": "/workspace/unified-cache-management/examples/ucm_config_example.yaml"
+            "UCM_CONFIG_FILE": "/home/xujinhui/unified-cache-management/examples/ucm_config_example.yaml"
         },
     )
 
