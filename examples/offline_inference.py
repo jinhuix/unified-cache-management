@@ -2,6 +2,18 @@ import contextlib
 import os
 import time
 from dataclasses import asdict
+from datetime import datetime
+
+# 指定设备号
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# Profiler 配置
+ENABLE_PROFILER = True
+if ENABLE_PROFILER:
+    trace_dir = f"/home/xujinhui/unified-cache-management/examples/trace/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(trace_dir, exist_ok=True)
+    os.environ["VLLM_TORCH_PROFILER_DIR"] = trace_dir
+    print(f"[INFO] Profiler will save traces to: {trace_dir}")
 
 from transformers import AutoTokenizer
 
@@ -14,7 +26,6 @@ from ucm.logger import init_logger
 
 logger = init_logger(__name__)
 
-
 @contextlib.contextmanager
 def build_llm_with_uc(module_path: str, name: str, model: str):
     ktc = KVTransferConfig(
@@ -22,17 +33,17 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
         kv_connector_module_path=module_path,
         kv_role="kv_both",
         kv_connector_extra_config={
-            "UCM_CONFIG_FILE": "/workspace/unified-cache-management/examples/ucm_config_example.yaml"
+            "UCM_CONFIG_FILE": "/home/xujinhui/unified-cache-management/examples/ucm_config_example.yaml"
         },
     )
 
     llm_args = EngineArgs(
         model=model,
         kv_transfer_config=ktc,
-        max_model_len=5000,
+        max_model_len=8192,
         gpu_memory_utilization=0.8,
         max_num_batched_tokens=30000,
-        block_size=128,
+        block_size=512,
         enforce_eager=True,
         trust_remote_code=True,
         enable_prefix_caching=False,
@@ -60,19 +71,8 @@ def print_output(
     print(f"Generation took {time.time() - start:.2f} seconds, {req_str} request done.")
     print("-" * 50)
 
-
-def main():
-    module_path = "ucm.integration.vllm.ucm_connector"
-    name = "UCMConnector"
-    model = os.getenv("MODEL_PATH", "/home/models/DeepSeek-V2-Lite")
-
-    tokenizer = AutoTokenizer.from_pretrained(model, use_chat_template=True)
-
-    with build_llm_with_uc(module_path, name, model) as llm:
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a highly specialized assistant whose mission is to faithfully reproduce English "
+def generate_prompt(num_prompts=1, num_tokens=5):
+    message = """You are a highly specialized assistant whose mission is to faithfully reproduce English "
                 "literary texts verbatim, without any deviation, paraphrasing, or omission. Your primary "
                 "responsibility is accuracy: every word, every punctuation mark, and every line must "
                 "appear exactly as in the original source. Core Principles: Verbatim Reproduction: If the "
@@ -90,23 +90,46 @@ def main():
                 "should be able to compare your output directly with the original and find zero "
                 "differences. The measure of success is absolute textual fidelity. Your function can be "
                 "summarized as follows: verbatim reproduction only, no paraphrase, no commentary, "
-                "no embellishment, no omission.",
-            },
-            {
-                "role": "user",
-                "content": "Please reproduce verbatim the opening sentence of the United States Declaration of "
+                "no embellishment, no omission."
+                "Please reproduce verbatim the opening sentence of the United States Declaration of "
                 "Independence (1776), starting with 'When in the Course of human events' and continuing "
-                "word-for-word without paraphrasing.",
-            },
-        ]
+                "word-for-word without paraphrasing."""
+    prompts = []
+    dummy_text = message * num_tokens
 
-        prompts = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+    for i in range(num_prompts):
+        prompt = f"[Prompt {i}] {dummy_text}"
+        prompts.append(prompt)
+
+    return prompts
+
+def main():
+    module_path = "ucm.integration.vllm.ucm_connector"
+    name = "UCMConnector"
+    model = os.getenv("MODEL_PATH", "/home/models/DeepSeek-V2-Lite")
+
+    tokenizer = AutoTokenizer.from_pretrained(model, use_chat_template=True)
+
+    with build_llm_with_uc(module_path, name, model) as llm:
+        # 启动 profiler（参考 LMCache 的用法）
+        if ENABLE_PROFILER:
+            print("\n[INFO] Starting profiler...")
+            llm.start_profile()
+        
+        prompts = generate_prompt(num_prompts=1, num_tokens=5)
         sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=100)
 
-        print_output(llm, prompts, sampling_params, "first")
-        print_output(llm, prompts, sampling_params, "second")
+        # 多次推理
+        num_decodes = 3
+        for i in range(num_decodes):
+            print(f"[RUN] decode iter {i+1}/{num_decodes}")
+            print_output(llm, prompts, sampling_params, f"decode-{i+1}")
+        
+        # 停止 profiler
+        if ENABLE_PROFILER:
+            print("\n[INFO] Stopping profiler...")
+            llm.stop_profile()
+            print("[SUCCESS] Profiler traces saved. Check vLLM logs for trace location.")
 
 
 if __name__ == "__main__":
