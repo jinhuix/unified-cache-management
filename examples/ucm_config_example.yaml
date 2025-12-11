@@ -9,10 +9,13 @@
 
 # Connector name (e.g., "UcmNfsStore", "UcmDramStore")
 ucm_connectors:
-  - ucm_connector_name: "UcmNfsStore"
+  - ucm_connector_name: "UcmDramStore"
     ucm_connector_config:
-      storage_backends: "/home/xujinhui/test_backend"
-      use_direct: false
+      # Maximum cache size in bytes (default: 5GB = 5368709120)
+      max_cache_size: 5368709120
+      enable_coordination: true
+      scheduler_addr: "tcp://127.0.0.1:5555"
+      zmq_timeout: 1000
 
 load_only_first_rank: false
 
