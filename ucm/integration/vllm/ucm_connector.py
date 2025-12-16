@@ -3,6 +3,7 @@ import itertools
 import os
 import pickle
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, List, Optional
 
@@ -658,12 +659,113 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
         super().__init__(vllm_config, role)
+        self.layerwise_load_tasks: dict[str, dict[str, Task]] = {}
+        self.layerwise_dump_tasks: dict[str, dict[str, list[Task]]] = {}
+        self.created_blocks: set[str] = set()
+        self.layer_names_list: list[str] = []
+        self.request_load_metadata: dict = {}
+        self._prefetch_executor: Optional[ThreadPoolExecutor] = None
+        self._layer_load_futures: dict[str, Future] = {}
+
+    def _schedule_layer_load(self, layer_name: str) -> None:
+        if not layer_name or layer_name not in self.kv_caches or self.local_rank < 0:
+            return
+        if layer_name in self._layer_load_futures:
+            return
+        
+        if self._prefetch_executor is None:
+            self._prefetch_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ucm_layerwise_prefetch"
+            )
+
+        def _run() -> None:
+            if current_platform.is_cuda_alike():
+                torch.cuda.set_device(self.local_rank)
+            self._load_single_layer(layer_name)
+
+        self._layer_load_futures[layer_name] = self._prefetch_executor.submit(_run)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
-        raise NotImplementedError
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
 
-    def wait_for_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
-        raise NotImplementedError
+        self._init_kv_caches_from_forward_context(forward_context)
+
+        self.layerwise_load_tasks.clear()
+        self.layerwise_dump_tasks.clear()
+        self.request_load_metadata.clear()
+        self._layer_load_futures.clear()
+        self.load_start_time = time.perf_counter() * 1000
+
+        if not self._layer_offset_cache:
+            self._precompute_layer_offsets()
+
+        self.layer_names_list = list(self.kv_caches.keys())
+        if not self.layer_names_list:
+            return
+
+        for request_id, request_meta in metadata.request_meta.items():
+            if len(request_meta.load_block_ids[0]) == 0:
+                continue
+
+            ucm_block_ids, vllm_block_ids = request_meta.load_block_ids
+            if self.global_rank != 0 and not self.is_mla and not self.is_dsa:
+                ucm_block_ids = [str(self.request_hasher(bid)) for bid in ucm_block_ids]
+
+            self.request_load_metadata[request_id] = {
+                'ucm_block_ids': ucm_block_ids,
+                'vllm_block_ids': vllm_block_ids,
+            }
+            self.layerwise_load_tasks[request_id] = {}
+
+        if self.layer_names_list:
+            self._load_single_layer(self.layer_names_list[0])
+            logger.debug("Pipeline start: submitted load for layer 0")
+
+    def _load_single_layer(self, layer_name: str) -> None:
+        kv_layer = self.kv_caches.get(layer_name)
+        if kv_layer is None:
+            return
+
+        for request_id, req_meta in self.request_load_metadata.items():
+            tensors, offsets = self._get_tensor_and_offset(
+                req_meta['vllm_block_ids'], kv_layer, layer_name
+            )
+            block_ids = req_meta['ucm_block_ids'] * (1 if self.is_mla else 2)
+            self.layerwise_load_tasks[request_id][layer_name] = self.store.load(
+                block_ids, offsets, tensors
+            )
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if not self.layerwise_load_tasks:
+            return
+
+        fut = self._layer_load_futures.get(layer_name)
+        if fut is not None:
+            try:
+                fut.result()
+            except Exception as e:
+                logger.error(f"Async load failed for layer {layer_name}: {e}")
+                return
+
+        current_stream = torch.cuda.current_stream()
+        for request_id, layer_tasks in self.layerwise_load_tasks.items():
+            task = layer_tasks.get(layer_name)
+            if task is None or task.status != 0:
+                continue
+            
+            if hasattr(task, "event") and task.event is not None:
+                current_stream.wait_event(task.event)
+            elif hasattr(task, "stream") and task.stream is not None:
+                current_stream.wait_stream(task.stream)
+
+        try:
+            next_idx = self.layer_names_list.index(layer_name) + 1
+            if next_idx < len(self.layer_names_list):
+                self._schedule_layer_load(self.layer_names_list[next_idx])
+                logger.debug(f"Pipeline: scheduled load for layer {next_idx}")
+        except ValueError:
+            pass
 
     def save_kv_layer(
         self,
@@ -672,10 +774,70 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        raise NotImplementedError
+        if (self.is_mla or self.is_dsa) and self.global_rank != 0:
+            return
+
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
+
+        if self._is_first_layer(layer_name):
+            self.created_blocks.clear()
+            self.layerwise_dump_tasks.clear()
+            self.save_start_time = time.perf_counter() * 1000
+
+            for request_id, request_meta in metadata.request_meta.items():
+                if len(request_meta.dump_block_ids[0]) == 0:
+                    continue
+
+                ucm_block_ids = request_meta.dump_block_ids[0]
+                if self.global_rank != 0:
+                    ucm_block_ids = [str(self.request_hasher(bid)) for bid in ucm_block_ids]
+
+                rets = self.store.create(ucm_block_ids)
+                self.created_blocks.update(
+                    bid for bid, ret in zip(ucm_block_ids, rets) if ret == 0
+                )
+
+        for request_id, request_meta in metadata.request_meta.items():
+            if len(request_meta.dump_block_ids[0]) == 0:
+                continue
+
+            ucm_block_ids, vllm_block_ids = request_meta.dump_block_ids
+            if self.global_rank != 0:
+                ucm_block_ids = [str(self.request_hasher(bid)) for bid in ucm_block_ids]
+
+            valid_pairs = [
+                (u, v) for u, v in zip(ucm_block_ids, vllm_block_ids)
+                if u in self.created_blocks
+            ]
+            if not valid_pairs:
+                continue
+
+            ucm_ids, vllm_ids = zip(*valid_pairs)
+            tensors, offsets = self._get_tensor_and_offset(list(vllm_ids), kv_layer, layer_name)
+            block_ids = list(ucm_ids) * (1 if self.is_mla else 2)
+            task = self.store.dump(block_ids, offsets, tensors)
+            
+            self.layerwise_dump_tasks.setdefault(request_id, {}).setdefault(layer_name, []).append(task)
 
     def wait_for_save(self) -> None:
-        raise NotImplementedError
+        if (self.is_mla or self.is_dsa) and self.global_rank != 0:
+            return
+
+        for request_id, layer_tasks in self.layerwise_dump_tasks.items():
+            for layer_name, tasks in layer_tasks.items():
+                for task in tasks:
+                    if self.store.wait(task) != 0:
+                        logger.error(f"Save failed: layer {layer_name}, request {request_id}")
+
+        if self.created_blocks:
+            self.store.commit(list(self.created_blocks), True)
+
+        self.layerwise_dump_tasks.clear()
+        self.created_blocks.clear()
+
+    def _is_first_layer(self, layer_name: str) -> bool:
+        return self.kv_caches and layer_name == next(iter(self.kv_caches.keys()))
 
 
 class UCMPDConnector(UCMDirectConnector):
@@ -755,15 +917,24 @@ class UCMConnector(KVConnectorBase_V1):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
         self.connector: KVConnectorBase_V1
-        # TODO new conn by config
-        if (
-            self._vllm_config.kv_transfer_config is not None
-            and "hit_ratio"
-            in self._vllm_config.kv_transfer_config.kv_connector_extra_config
-        ):
+        
+        extra_config = (
+            self._vllm_config.kv_transfer_config.kv_connector_extra_config
+            if self._vllm_config.kv_transfer_config is not None
+            else {}
+        )
+        ucm_config = Config(vllm_config.kv_transfer_config)
+        launch_config = ucm_config.get_config()
+        
+        if "hit_ratio" in extra_config or "hit_ratio" in launch_config:
             self.connector = UCMMockConnector(vllm_config, role)
+            logger.info("Using UCMMockConnector for hit ratio testing")
+        elif extra_config.get("use_layerwise", False) or launch_config.get("use_layerwise", False):
+            self.connector = UCMLayerWiseConnector(vllm_config, role)
+            logger.info("Using UCMLayerWiseConnector for layer-wise pipelining")
         else:
             self.connector = UCMDirectConnector(vllm_config, role)
+            logger.info("Using UCMDirectConnector for synchronous mode")
 
     def get_num_new_matched_tokens(
         self,
