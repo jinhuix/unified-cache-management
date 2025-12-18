@@ -749,15 +749,20 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 return
 
         current_stream = torch.cuda.current_stream()
+        load_stream = None
+        
         for request_id, layer_tasks in self.layerwise_load_tasks.items():
             task = layer_tasks.get(layer_name)
             if task is None or task.status != 0:
                 continue
             
-            if hasattr(task, "event") and task.event is not None:
-                current_stream.wait_event(task.event)
-            elif hasattr(task, "stream") and task.stream is not None:
-                current_stream.wait_stream(task.stream)
+            if hasattr(task, "stream") and task.stream is not None:
+                load_stream = task.stream
+                break
+        
+        if load_stream is not None:
+            current_stream.wait_stream(load_stream)
+            logger.debug(f"Compute stream waiting for load stream to finish layer {layer_name}")
 
         try:
             next_idx = self.layer_names_list.index(layer_name) + 1
@@ -824,11 +829,18 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         if (self.is_mla or self.is_dsa) and self.global_rank != 0:
             return
 
+        dump_stream = None
         for request_id, layer_tasks in self.layerwise_dump_tasks.items():
             for layer_name, tasks in layer_tasks.items():
                 for task in tasks:
+                    if hasattr(task, "stream") and task.stream is not None:
+                        dump_stream = task.stream
                     if self.store.wait(task) != 0:
                         logger.error(f"Save failed: layer {layer_name}, request {request_id}")
+        
+        if dump_stream is not None:
+            dump_stream.synchronize()
+            logger.debug("Synchronized dump stream after all layers saved")
 
         if self.created_blocks:
             self.store.commit(list(self.created_blocks), True)

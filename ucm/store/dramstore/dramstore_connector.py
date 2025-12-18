@@ -35,9 +35,10 @@ from ucm.store.ucmstore import Task, UcmKVStoreBase
 
 @dataclass
 class DramTask(Task):
-    stream: torch.cuda.Stream = None
-    event: torch.cuda.Event = None
-    pinned_buffers: List[torch.Tensor] = field(default_factory=list)
+    stream: Optional[torch.cuda.Stream] = None
+    packed_buffer: Optional[torch.Tensor] = None
+    packed_starts: List[int] = field(default_factory=list)
+    packed_sizes: List[int] = field(default_factory=list)
     is_load: bool = True
     status: int = 0
     block_ids: List[str] = field(default_factory=list)
@@ -117,17 +118,61 @@ class UcmDramStore(UcmKVStoreBase):
         self.lock = threading.Lock()
         # ZMQ setup
         self.coordinator = DramStoreCoordinator(self.role, zmq_addr="tcp://127.0.0.1:5555")
+        
+        self._load_stream: Optional[torch.cuda.Stream] = None
+        self._dump_stream: Optional[torch.cuda.Stream] = None
+        
+        self._pinned_pool: Dict[int, List[torch.Tensor]] = {}
+        self._pool_lock = threading.Lock()
+        self._preallocate_pinned_pool()
+    
+    def _preallocate_pinned_pool(self):
+        if self.kv_block_size > 0:
+            for _ in range(4):
+                buf = torch.empty(self.kv_block_size, dtype=torch.uint8, pin_memory=True)
+                self._pinned_pool.setdefault(self.kv_block_size, []).append(buf)
+    
+    def _get_pinned(self, num_bytes: int) -> torch.Tensor:
+        with self._pool_lock:
+            pool = self._pinned_pool.get(num_bytes)
+            if pool:
+                return pool.pop()
+        return torch.empty(num_bytes, dtype=torch.uint8, pin_memory=True)
+
+    def _put_pinned(self, buf: torch.Tensor) -> None:
+        if buf is None:
+            return
+        size = buf.numel()
+        with self._pool_lock:
+            pool = self._pinned_pool.get(size)
+            if pool is None:
+                self._pinned_pool[size] = [buf]
+            elif len(pool) < 8:
+                pool.append(buf)
 
     def cc_store(self) -> int:
         return 0
 
     def create(self, block_ids: List[str]) -> List[int]:
+        new_blocks = []
         with self.lock:
             for block_id in block_ids:
                 if block_id not in self.storage:
-                    self.storage[block_id] = torch.empty(
-                        self.kv_block_size, dtype=torch.uint8, pin_memory=True
-                    )
+                    new_blocks.append(block_id)
+        
+        if new_blocks:
+            buffers = []
+            for _ in new_blocks:
+                buf = self._get_pinned(self.kv_block_size)
+                buffers.append(buf)
+            
+            with self.lock:
+                for block_id, buf in zip(new_blocks, buffers):
+                    if block_id not in self.storage:
+                        self.storage[block_id] = buf
+                    else:
+                        self._put_pinned(buf)
+        
         return [0] * len(block_ids)
 
     def lookup(self, block_ids: List[str]) -> List[bool]:
@@ -139,9 +184,7 @@ class UcmDramStore(UcmKVStoreBase):
     def load(
         self, block_ids: List[str], offset: List[int], dst_tensor: List[torch.Tensor]
     ) -> Task:
-        stream = torch.cuda.Stream()
-        event = torch.cuda.Event()
-        task = DramTask(stream=stream, event=event, is_load=True)
+        task = DramTask(is_load=True)
         
         buffers = []
         for block_id in block_ids:
@@ -151,34 +194,55 @@ class UcmDramStore(UcmKVStoreBase):
                 return task
             buffers.append(buf)
         
+        if self._load_stream is None:
+            self._load_stream = torch.cuda.Stream()
+            logger.debug("Created dedicated load stream for async H2D transfer")
+        stream = self._load_stream
+        task.stream = stream
+        
         with torch.cuda.stream(stream):
             for buf, off, dst in zip(buffers, offset, dst_tensor):
                 size = dst.numel() * dst.element_size()
                 src = buf[off : off + size].view(dst.dtype).reshape(dst.shape)
                 dst.copy_(src, non_blocking=True)
-            event.record(stream)
         
         return task
 
     def dump(
         self, block_ids: List[str], offset: List[int], src_tensor: List[torch.Tensor]
     ) -> Task:
-        stream = torch.cuda.Stream()
-        event = torch.cuda.Event()
-        task = DramTask(
-            stream=stream, 
-            event=event, 
-            is_load=False, 
-            block_ids=block_ids, 
-            offsets=offset
-        )
-        
+        task = DramTask(is_load=False, block_ids=block_ids, offsets=offset)
+
+        sizes = [t.numel() * t.element_size() for t in src_tensor]
+        total = sum(sizes)
+        if total == 0:
+            return task
+
+        starts = []
+        pos = 0
+        for s in sizes:
+            starts.append(pos)
+            pos += s
+
+        packed = self._get_pinned(total)
+        task.packed_buffer = packed
+        task.packed_starts = starts
+        task.packed_sizes = sizes
+
+        if self._dump_stream is None:
+            self._dump_stream = torch.cuda.Stream()
+            logger.debug("Created dedicated dump stream for async D2H transfer")
+        stream = self._dump_stream
+        task.stream = stream
+
+        current_stream = torch.cuda.current_stream()
         with torch.cuda.stream(stream):
-            for tensor in src_tensor:
-                buf = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
-                buf.copy_(tensor, non_blocking=True)
-                task.pinned_buffers.append(buf)
-            event.record(stream)
+            stream.wait_stream(current_stream)
+            for t, start, size in zip(src_tensor, starts, sizes):
+                dst = packed[start : start + size]
+                src = t.view(torch.uint8).reshape(-1)
+                dst.copy_(src, non_blocking=True)
+
         return task
 
     def fetch_data(
@@ -206,19 +270,25 @@ class UcmDramStore(UcmKVStoreBase):
         if task.stream:
             task.stream.synchronize()
         
-        if task.is_load or not task.pinned_buffers:
+        if task.is_load:
             return 0
-        
-        with self.lock:
-            for block_id, off, pinned_buf in zip(
-                task.block_ids, task.offsets, task.pinned_buffers
-            ):
-                storage_buf = self.storage.get(block_id)
-                if storage_buf is None:
-                    continue
-                
-                size = pinned_buf.numel() * pinned_buf.element_size()
-                storage_buf[off : off + size].copy_(pinned_buf.flatten().view(torch.uint8))
+
+        if task.packed_buffer is not None and task.packed_sizes:
+            with self.lock:
+                for bid, off, start, size in zip(
+                    task.block_ids, task.offsets, task.packed_starts, task.packed_sizes
+                ):
+                    storage_buf = self.storage.get(bid)
+                    if storage_buf is None:
+                        continue
+                    storage_buf[off : off + size].copy_(
+                        task.packed_buffer[start : start + size]
+                    )
+            
+            self._put_pinned(task.packed_buffer)
+            task.packed_buffer = None
+            task.packed_starts.clear()
+            task.packed_sizes.clear()
         
         return 0
 
