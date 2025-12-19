@@ -71,3 +71,6 @@ UcmConnectorFactory.register_connector(
     "ucm.store.mooncakestore.mooncake_connector",
     "UcmMooncakeStore",
 )
+UcmConnectorFactory.register_connector(
+    "UcmCpuStore", "ucm.store.cpustore.cpu_connector", "UcmCpuStore"
+)
