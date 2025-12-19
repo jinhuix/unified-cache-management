@@ -5,13 +5,15 @@ from dataclasses import asdict
 from datetime import datetime
 
 # 指定设备号
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+TP_SIZE = 1
 
 # Profiler 配置
 ENABLE_PROFILER = True
+trace_dir = f"/home/xujinhui/unified-cache-management/examples/trace/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+os.makedirs(trace_dir, exist_ok=True)
+os.environ["UNIFIED_CACHE_LOG_LEVEL"] = "INFO"
 if ENABLE_PROFILER:
-    trace_dir = f"/home/xujinhui/unified-cache-management/examples/trace/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    os.makedirs(trace_dir, exist_ok=True)
     os.environ["VLLM_TORCH_PROFILER_DIR"] = trace_dir
     print(f"[INFO] Profiler will save traces to: {trace_dir}")
 
@@ -40,10 +42,10 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
     llm_args = EngineArgs(
         model=model,
         kv_transfer_config=ktc,
-        max_model_len=8192,
+        max_model_len=5000,
         gpu_memory_utilization=0.8,
         max_num_batched_tokens=30000,
-        block_size=512,
+        block_size=128,
         enforce_eager=True,
         trust_remote_code=True,
         enable_prefix_caching=False,
@@ -64,11 +66,11 @@ def print_output(
 ):
     start = time.time()
     outputs = llm.generate(prompt, sampling_params)
+    print(f"Generation took {time.time() - start:.2f} seconds, {req_str} request done.")
     print("-" * 50)
     for output in outputs:
         generated_text = output.outputs[0].text
         print(f"Generated text: {generated_text!r}")
-    print(f"Generation took {time.time() - start:.2f} seconds, {req_str} request done.")
     print("-" * 50)
 
 def generate_prompt(num_prompts=1, num_tokens=5):
@@ -106,21 +108,21 @@ def generate_prompt(num_prompts=1, num_tokens=5):
 def main():
     module_path = "ucm.integration.vllm.ucm_connector"
     name = "UCMConnector"
-    model = os.getenv("MODEL_PATH", "/home/models/DeepSeek-V2-Lite")
+    model = os.getenv("MODEL_PATH", "/home/models/Qwen2.5-14B-Instruct")
 
     tokenizer = AutoTokenizer.from_pretrained(model, use_chat_template=True)
 
     with build_llm_with_uc(module_path, name, model) as llm:
+        prompts = generate_prompt(num_prompts=1, num_tokens=10)
+        sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=100)
+
         # 启动 profiler（参考 LMCache 的用法）
         if ENABLE_PROFILER:
             print("\n[INFO] Starting profiler...")
             llm.start_profile()
-        
-        prompts = generate_prompt(num_prompts=1, num_tokens=5)
-        sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=100)
 
         # 多次推理
-        num_decodes = 3
+        num_decodes = 2
         for i in range(num_decodes):
             print(f"[RUN] decode iter {i+1}/{num_decodes}")
             print_output(llm, prompts, sampling_params, f"decode-{i+1}")

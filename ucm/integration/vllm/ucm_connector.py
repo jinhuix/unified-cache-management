@@ -719,8 +719,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             self.layerwise_load_tasks[request_id] = {}
 
         if self.layer_names_list:
-            self._load_single_layer(self.layer_names_list[0])
             logger.debug("Pipeline start: submitted load for layer 0")
+            for layer_name in self.layer_names_list[0:]:
+                self._schedule_layer_load(layer_name)
 
     def _load_single_layer(self, layer_name: str) -> None:
         kv_layer = self.kv_caches.get(layer_name)
@@ -764,13 +765,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             current_stream.wait_stream(load_stream)
             logger.debug(f"Compute stream waiting for load stream to finish layer {layer_name}")
 
-        try:
-            next_idx = self.layer_names_list.index(layer_name) + 1
-            if next_idx < len(self.layer_names_list):
-                self._schedule_layer_load(self.layer_names_list[next_idx])
-                logger.debug(f"Pipeline: scheduled load for layer {next_idx}")
-        except ValueError:
-            pass
+        return
 
     def save_kv_layer(
         self,

@@ -113,6 +113,8 @@ class UcmDramStore(UcmKVStoreBase):
         super().__init__(config)
         self.role = config.get("role", "worker")
         self.kv_block_size = config.get("kv_block_size", 0)
+        self.max_cache_size = config.get("max_cache_size", 5368709120)  # Default 5GB
+        
         # Local DRAM storage with pin_memory
         self.storage: Dict[str, torch.Tensor] = {}
         self.lock = threading.Lock()
@@ -127,17 +129,34 @@ class UcmDramStore(UcmKVStoreBase):
         self._preallocate_pinned_pool()
     
     def _preallocate_pinned_pool(self):
-        if self.kv_block_size > 0:
-            for _ in range(4):
-                buf = torch.empty(self.kv_block_size, dtype=torch.uint8, pin_memory=True)
-                self._pinned_pool.setdefault(self.kv_block_size, []).append(buf)
+        if self.kv_block_size > 0 and self.max_cache_size > 0:
+            num_blocks = (self.max_cache_size // self.kv_block_size) + 16
+
+            buffers = []
+            for i in range(num_blocks):
+                try:
+                    buf = torch.empty(self.kv_block_size, dtype=torch.uint8, pin_memory=True)
+                    buffers.append(buf)
+                except RuntimeError as e:
+                    logger.warning(f"Failed to allocate pinned buffer {i}/{num_blocks}: {e}")
+                    break
+            
+            self._pinned_pool[self.kv_block_size] = buffers
     
-    def _get_pinned(self, num_bytes: int) -> torch.Tensor:
+    def _get_pinned(self, num_bytes: int, count: int) -> List[torch.Tensor]:
+        buffers = []
         with self._pool_lock:
-            pool = self._pinned_pool.get(num_bytes)
-            if pool:
-                return pool.pop()
-        return torch.empty(num_bytes, dtype=torch.uint8, pin_memory=True)
+            pool = self._pinned_pool.get(num_bytes, [])
+            available = min(count, len(pool))
+            for _ in range(available):
+                buffers.append(pool.pop())
+        
+        remaining = count - len(buffers)
+        if remaining > 0:
+            for _ in range(remaining):
+                buffers.append(torch.empty(num_bytes, dtype=torch.uint8, pin_memory=True))
+        
+        return buffers
 
     def _put_pinned(self, buf: torch.Tensor) -> None:
         if buf is None:
@@ -145,10 +164,13 @@ class UcmDramStore(UcmKVStoreBase):
         size = buf.numel()
         with self._pool_lock:
             pool = self._pinned_pool.get(size)
-            if pool is None:
-                self._pinned_pool[size] = [buf]
-            elif len(pool) < 8:
+            if pool is not None:
                 pool.append(buf)
+            else:
+                if size == self.kv_block_size:
+                    self._pinned_pool[size] = [buf]
+                elif len(self._pinned_pool.get(size, [])) < 8:
+                    self._pinned_pool.setdefault(size, []).append(buf)
 
     def cc_store(self) -> int:
         return 0
@@ -161,10 +183,7 @@ class UcmDramStore(UcmKVStoreBase):
                     new_blocks.append(block_id)
         
         if new_blocks:
-            buffers = []
-            for _ in new_blocks:
-                buf = self._get_pinned(self.kv_block_size)
-                buffers.append(buf)
+            buffers = self._get_pinned(self.kv_block_size, len(new_blocks))
             
             with self.lock:
                 for block_id, buf in zip(new_blocks, buffers):
@@ -197,10 +216,9 @@ class UcmDramStore(UcmKVStoreBase):
         if self._load_stream is None:
             self._load_stream = torch.cuda.Stream()
             logger.debug("Created dedicated load stream for async H2D transfer")
-        stream = self._load_stream
-        task.stream = stream
+        task.stream = self._load_stream
         
-        with torch.cuda.stream(stream):
+        with torch.cuda.stream(self._load_stream):
             for buf, off, dst in zip(buffers, offset, dst_tensor):
                 size = dst.numel() * dst.element_size()
                 src = buf[off : off + size].view(dst.dtype).reshape(dst.shape)
@@ -224,7 +242,7 @@ class UcmDramStore(UcmKVStoreBase):
             starts.append(pos)
             pos += s
 
-        packed = self._get_pinned(total)
+        packed = self._get_pinned(total, 1)[0]
         task.packed_buffer = packed
         task.packed_starts = starts
         task.packed_sizes = sizes
