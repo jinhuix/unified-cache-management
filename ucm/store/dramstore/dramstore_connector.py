@@ -36,9 +36,6 @@ from ucm.store.ucmstore import Task, UcmKVStoreBase
 @dataclass
 class DramTask(Task):
     stream: Optional[torch.cuda.Stream] = None
-    packed_buffer: Optional[torch.Tensor] = None
-    packed_starts: List[int] = field(default_factory=list)
-    packed_sizes: List[int] = field(default_factory=list)
     is_load: bool = True
     status: int = 0
     block_ids: List[str] = field(default_factory=list)
@@ -231,34 +228,27 @@ class UcmDramStore(UcmKVStoreBase):
     ) -> Task:
         task = DramTask(is_load=False, block_ids=block_ids, offsets=offset)
 
-        sizes = [t.numel() * t.element_size() for t in src_tensor]
-        total = sum(sizes)
-        if total == 0:
+        if len(src_tensor) == 0:
             return task
-
-        starts = []
-        pos = 0
-        for s in sizes:
-            starts.append(pos)
-            pos += s
-
-        packed = self._get_pinned(total, 1)[0]
-        task.packed_buffer = packed
-        task.packed_starts = starts
-        task.packed_sizes = sizes
 
         if self._dump_stream is None:
             self._dump_stream = torch.cuda.Stream()
             logger.debug("Created dedicated dump stream for async D2H transfer")
-        stream = self._dump_stream
-        task.stream = stream
+        task.stream = self._dump_stream
 
         current_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(stream):
-            stream.wait_stream(current_stream)
-            for t, start, size in zip(src_tensor, starts, sizes):
-                dst = packed[start : start + size]
-                src = t.view(torch.uint8).reshape(-1)
+        with torch.cuda.stream(self._dump_stream):
+            self._dump_stream.wait_stream(current_stream)
+            
+            for bid, off, src in zip(block_ids, offset, src_tensor):
+                storage_buf = self.storage.get(bid)
+                if storage_buf is None:
+                    logger.error(f"Block {bid} not found in storage during dump")
+                    task.status = -1
+                    return task
+                
+                size = src.numel() * src.element_size()
+                dst = storage_buf[off : off + size].view(src.dtype).reshape(src.shape)
                 dst.copy_(src, non_blocking=True)
 
         return task
@@ -287,26 +277,6 @@ class UcmDramStore(UcmKVStoreBase):
         
         if task.stream:
             task.stream.synchronize()
-        
-        if task.is_load:
-            return 0
-
-        if task.packed_buffer is not None and task.packed_sizes:
-            with self.lock:
-                for bid, off, start, size in zip(
-                    task.block_ids, task.offsets, task.packed_starts, task.packed_sizes
-                ):
-                    storage_buf = self.storage.get(bid)
-                    if storage_buf is None:
-                        continue
-                    storage_buf[off : off + size].copy_(
-                        task.packed_buffer[start : start + size]
-                    )
-            
-            self._put_pinned(task.packed_buffer)
-            task.packed_buffer = None
-            task.packed_starts.clear()
-            task.packed_sizes.clear()
         
         return 0
 
