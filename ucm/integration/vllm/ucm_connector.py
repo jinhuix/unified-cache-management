@@ -668,7 +668,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self._layer_load_futures: dict[str, Future] = {}
 
     def _schedule_layer_load(self, layer_name: str) -> None:
-        if not layer_name or layer_name not in self.kv_caches or self.local_rank < 0:
+        if layer_name not in self.kv_caches or self.local_rank < 0:
             return
         if layer_name in self._layer_load_futures:
             return
@@ -695,7 +695,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.layerwise_dump_tasks.clear()
         self.request_load_metadata.clear()
         self._layer_load_futures.clear()
-        self.load_start_time = time.perf_counter() * 1000
 
         if not self._layer_offset_cache:
             self._precompute_layer_offsets()
@@ -720,7 +719,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         if self.layer_names_list:
             logger.debug("Pipeline start: submitted load for layer 0")
-            for layer_name in self.layer_names_list[0:]:
+            for layer_name in self.layer_names_list:
                 self._schedule_layer_load(layer_name)
 
     def _load_single_layer(self, layer_name: str) -> None:
@@ -743,29 +742,14 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         fut = self._layer_load_futures.get(layer_name)
         if fut is not None:
-            try:
-                fut.result()
-            except Exception as e:
-                logger.error(f"Async load failed for layer {layer_name}: {e}")
-                return
-
-        current_stream = torch.cuda.current_stream()
-        load_stream = None
+            fut.result()
         
         for request_id, layer_tasks in self.layerwise_load_tasks.items():
             task = layer_tasks.get(layer_name)
-            if task is None or task.status != 0:
-                continue
-            
-            if hasattr(task, "stream") and task.stream is not None:
-                load_stream = task.stream
-                break
-        
-        if load_stream is not None:
-            current_stream.wait_stream(load_stream)
-            logger.debug(f"Compute stream waiting for load stream to finish layer {layer_name}")
-
-        return
+            if task and task.status == 0 and getattr(task, "stream", None):
+                torch.cuda.current_stream().wait_stream(task.stream)
+                logger.debug(f"Compute stream waiting for load stream (layer {layer_name})")
+                return
 
     def save_kv_layer(
         self,
