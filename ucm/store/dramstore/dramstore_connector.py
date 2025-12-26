@@ -23,8 +23,9 @@
 #
 import json
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import zmq
@@ -117,6 +118,10 @@ class UcmDramStore(UcmKVStoreBase):
         # ZMQ setup
         self.coordinator = DramStoreCoordinator(self.role, zmq_addr="tcp://127.0.0.1:5555")
         
+        # Async load thread pool
+        self._async_executor: Optional[ThreadPoolExecutor] = None
+        self._async_futures: Dict[str, Future] = {}
+
         self._dump_stream: Optional[torch.cuda.Stream] = torch.cuda.Stream()
         self._load_stream: Optional[torch.cuda.Stream] = torch.cuda.Stream()
         
@@ -279,3 +284,27 @@ class UcmDramStore(UcmKVStoreBase):
 
     def check(self, task: Task) -> Tuple[int, bool]:
         pass
+
+    def submit_async_load(self, key: str, load_func: Callable[[], None], device_id: int = -1) -> None:
+        if key in self._async_futures:
+            return
+        
+        if self._async_executor is None:
+            self._async_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="dramstore_async_load"
+            )
+        
+        def _run() -> None:
+            if device_id >= 0:
+                torch.cuda.set_device(device_id)
+            load_func()
+        
+        self._async_futures[key] = self._async_executor.submit(_run)
+    
+    def wait_async_load(self, key: str) -> None:
+        fut = self._async_futures.get(key)
+        if fut is not None:
+            fut.result()
+    
+    def clear_async_loads(self) -> None:
+        self._async_futures.clear()

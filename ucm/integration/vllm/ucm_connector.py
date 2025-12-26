@@ -3,9 +3,8 @@ import itertools
 import os
 import pickle
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from vllm.config import VllmConfig
@@ -664,26 +663,17 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.created_blocks: set[str] = set()
         self.layer_names_list: list[str] = []
         self.request_load_metadata: dict = {}
-        self._prefetch_executor: Optional[ThreadPoolExecutor] = None
-        self._layer_load_futures: dict[str, Future] = {}
 
     def _schedule_layer_load(self, layer_name: str) -> None:
         if layer_name not in self.kv_caches or self.local_rank < 0:
             return
-        if layer_name in self._layer_load_futures:
-            return
         
-        if self._prefetch_executor is None:
-            self._prefetch_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="ucm_layerwise_prefetch"
-            )
-
-        def _run() -> None:
-            if current_platform.is_cuda_alike():
-                torch.cuda.set_device(self.local_rank)
-            self._load_single_layer(layer_name)
-
-        self._layer_load_futures[layer_name] = self._prefetch_executor.submit(_run)
+        device_id = self.local_rank if current_platform.is_cuda_alike() else -1
+        self.store.submit_async_load(
+            layer_name,
+            lambda: self._load_single_layer(layer_name),
+            device_id
+        )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
@@ -694,7 +684,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.layerwise_load_tasks.clear()
         self.layerwise_dump_tasks.clear()
         self.request_load_metadata.clear()
-        self._layer_load_futures.clear()
+        self.store.clear_async_loads()
 
         if not self._layer_offset_cache:
             self._precompute_layer_offsets()
@@ -740,9 +730,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         if not self.layerwise_load_tasks:
             return
 
-        fut = self._layer_load_futures.get(layer_name)
-        if fut is not None:
-            fut.result()
+        self.store.wait_async_load(layer_name)
         
         for request_id, layer_tasks in self.layerwise_load_tasks.items():
             task = layer_tasks.get(layer_name)
