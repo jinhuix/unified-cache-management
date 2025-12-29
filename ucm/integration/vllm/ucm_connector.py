@@ -664,17 +664,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.layer_names_list: list[str] = []
         self.request_load_metadata: dict = {}
 
-    def _schedule_layer_load(self, layer_name: str) -> None:
-        if layer_name not in self.kv_caches or self.local_rank < 0:
-            return
-        
-        device_id = self.local_rank if current_platform.is_cuda_alike() else -1
-        self.store.submit_async_load(
-            layer_name,
-            lambda: self._load_single_layer(layer_name),
-            device_id
-        )
-
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
@@ -684,7 +673,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.layerwise_load_tasks.clear()
         self.layerwise_dump_tasks.clear()
         self.request_load_metadata.clear()
-        self.store.clear_async_loads()
 
         if not self._layer_offset_cache:
             self._precompute_layer_offsets()
@@ -708,9 +696,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             self.layerwise_load_tasks[request_id] = {}
 
         if self.layer_names_list:
-            logger.debug("Pipeline start: submitted load for layer 0")
+            logger.debug("Pipeline start: loading layers")
             for layer_name in self.layer_names_list:
-                self._schedule_layer_load(layer_name)
+                self._load_single_layer(layer_name)
 
     def _load_single_layer(self, layer_name: str) -> None:
         kv_layer = self.kv_caches.get(layer_name)
@@ -729,14 +717,11 @@ class UCMLayerWiseConnector(UCMDirectConnector):
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.layerwise_load_tasks:
             return
-
-        self.store.wait_async_load(layer_name)
         
         for request_id, layer_tasks in self.layerwise_load_tasks.items():
             task = layer_tasks.get(layer_name)
-            if task and task.status == 0 and getattr(task, "stream", None):
-                torch.cuda.current_stream().wait_stream(task.stream)
-                logger.debug(f"Compute stream waiting for load stream (layer {layer_name})")
+            if task:
+                self.store.wait(task)
                 return
 
     def save_kv_layer(
@@ -796,18 +781,11 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         if (self.is_mla or self.is_dsa) and self.global_rank != 0:
             return
 
-        dump_stream = None
         for request_id, layer_tasks in self.layerwise_dump_tasks.items():
             for layer_name, tasks in layer_tasks.items():
                 for task in tasks:
-                    if hasattr(task, "stream") and task.stream is not None:
-                        dump_stream = task.stream
                     if self.store.wait(task) != 0:
                         logger.error(f"Save failed: layer {layer_name}, request {request_id}")
-        
-        if dump_stream is not None:
-            dump_stream.synchronize()
-            logger.debug("Synchronized dump stream after all layers saved")
 
         if self.created_blocks:
             self.store.commit(list(self.created_blocks), True)

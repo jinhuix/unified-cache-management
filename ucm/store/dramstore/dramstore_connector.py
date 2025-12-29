@@ -25,7 +25,7 @@ import json
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import zmq
@@ -36,8 +36,8 @@ from ucm.store.ucmstore import Task, UcmKVStoreBase
 
 @dataclass
 class DramTask(Task):
+    future: Optional[Future] = None
     stream: Optional[torch.cuda.Stream] = None
-    is_load: bool = True
     status: int = 0
     block_ids: List[str] = field(default_factory=list)
     offsets: List[int] = field(default_factory=list)
@@ -117,10 +117,8 @@ class UcmDramStore(UcmKVStoreBase):
         self.storage: Dict[str, torch.Tensor] = {}
         # ZMQ setup
         self.coordinator = DramStoreCoordinator(self.role, zmq_addr="tcp://127.0.0.1:5555")
-        
-        # Async load thread pool
-        self._async_executor: Optional[ThreadPoolExecutor] = None
-        self._async_futures: Dict[str, Future] = {}
+        # Thread pool for async load operations
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dram_io")
 
         self._dump_stream: Optional[torch.cuda.Stream] = torch.cuda.Stream()
         self._load_stream: Optional[torch.cuda.Stream] = torch.cuda.Stream()
@@ -202,29 +200,36 @@ class UcmDramStore(UcmKVStoreBase):
     def load(
         self, block_ids: List[str], offset: List[int], dst_tensor: List[torch.Tensor]
     ) -> Task:
-        task = DramTask(is_load=True)
-        
-        buffers = []
-        for block_id in block_ids:
-            buf = self.storage.get(block_id)
-            if buf is None:
-                task.status = -1
-                return task
-            buffers.append(buf)
-        
+        task = DramTask()
         task.stream = self._load_stream
-        with torch.cuda.stream(self._load_stream):
-            for buf, off, dst in zip(buffers, offset, dst_tensor):
-                size = dst.numel() * dst.element_size()
-                src = buf[off : off + size].view(dst.dtype).reshape(dst.shape)
-                dst.copy_(src, non_blocking=True)
         
+        def _run():
+            try:
+                buffers = []
+                for block_id in block_ids:
+                    buf = self.storage.get(block_id)
+                    if buf is None:
+                        task.status = -1
+                        logger.error(f"Block {block_id} not found in storage during load")
+                        return
+                    buffers.append(buf)
+                
+                with torch.cuda.stream(self._load_stream):
+                    for buf, off, dst in zip(buffers, offset, dst_tensor):
+                        size = dst.numel() * dst.element_size()
+                        src = buf[off : off + size].view(dst.dtype).reshape(dst.shape)
+                        dst.copy_(src, non_blocking=True)
+            except Exception as e:
+                task.status = -1
+                logger.error(f"DRAM load failed: {e}")
+        
+        task.future = self.executor.submit(_run)
         return task
 
     def dump(
         self, block_ids: List[str], offset: List[int], src_tensor: List[torch.Tensor]
     ) -> Task:
-        task = DramTask(is_load=False, block_ids=block_ids, offsets=offset)
+        task = DramTask(block_ids=block_ids, offsets=offset)
 
         if len(src_tensor) == 0:
             return task
@@ -266,13 +271,23 @@ class UcmDramStore(UcmKVStoreBase):
         pass
 
     def wait(self, task: Task) -> int:
-        if not isinstance(task, DramTask) or task.status != 0:
-            return -1 if not isinstance(task, DramTask) else task.status
+        if not isinstance(task, DramTask):
+            return -1
+        
+        if task.status != 0:
+            return task.status
+        
+        if task.future:
+            try:
+                task.future.result()
+            except Exception as e:
+                logger.error(f"Task execution failed: {e}")
+                task.status = -1
         
         if task.stream:
             task.stream.synchronize()
         
-        return 0
+        return task.status
 
     def commit(self, block_ids: List[str], is_success: bool = True) -> None:
         if is_success:
@@ -284,27 +299,3 @@ class UcmDramStore(UcmKVStoreBase):
 
     def check(self, task: Task) -> Tuple[int, bool]:
         pass
-
-    def submit_async_load(self, key: str, load_func: Callable[[], None], device_id: int = -1) -> None:
-        if key in self._async_futures:
-            return
-        
-        if self._async_executor is None:
-            self._async_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="dramstore_async_load"
-            )
-        
-        def _run() -> None:
-            if device_id >= 0:
-                torch.cuda.set_device(device_id)
-            load_func()
-        
-        self._async_futures[key] = self._async_executor.submit(_run)
-    
-    def wait_async_load(self, key: str) -> None:
-        fut = self._async_futures.get(key)
-        if fut is not None:
-            fut.result()
-    
-    def clear_async_loads(self) -> None:
-        self._async_futures.clear()
