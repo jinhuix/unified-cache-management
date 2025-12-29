@@ -8,13 +8,14 @@ from datetime import datetime
 # 指定设备号
 TP_SIZE = 1
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["UNIFIED_CACHE_LOG_LEVEL"] = "INFO"
 
 # Profiler 配置
 # - ENABLE_NVTX=1：仅添加 NVTX 标记，配合 nsys 的 nvtx/cuda trace 便于在时间线上定位 decode
 ENABLE_NVTX = os.getenv("ENABLE_NVTX", "1") == "1"
 ENABLE_TORCH_PROFILER = os.getenv("ENABLE_TORCH_PROFILER", "0") == "1"
+if ENABLE_NVTX:
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 if ENABLE_TORCH_PROFILER:
     trace_dir = f"/home/xujinhui/unified-cache-management/examples/trace/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(trace_dir, exist_ok=True)

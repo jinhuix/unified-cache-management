@@ -74,3 +74,6 @@ UcmConnectorFactory.register_connector(
 UcmConnectorFactory.register_connector(
     "UcmCpuStore", "ucm.store.cpustore.cpu_connector", "UcmCpuStore"
 )
+UcmConnectorFactory.register_connector(
+    "UcmGdsStore", "ucm.store.gdsstore.gdsstore_connector", "UcmGdsStore"
+)
