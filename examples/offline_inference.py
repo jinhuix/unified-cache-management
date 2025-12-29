@@ -33,22 +33,21 @@ logger = init_logger(__name__)
 
 @contextlib.contextmanager
 def build_llm_with_uc(module_path: str, name: str, model: str):
+    # config_file="config_dramstore.yaml" | "config_gds.yaml"
     ktc = KVTransferConfig(
         kv_connector=name,
         kv_connector_module_path=module_path,
         kv_role="kv_both",
         kv_connector_extra_config={
-            "UCM_CONFIG_FILE": "/home/xujinhui/unified-cache-management/examples/ucm_config_example.yaml"
+            "UCM_CONFIG_FILE": "/home/xujinhui/unified-cache-management/examples/config_dramstore.yaml"
         },
     )
 
-        # compilation_config=CompilationConfig(
-        #     cudagraph_mode="FULL_AND_PIECEWISE",
-        # ),
-        # kv_transfer_config=ktc,
-
+    # cudagraph_mode="FULL_AND_PIECEWISE" | "FULL" | "PIECEWISE"
+    compilation_config=CompilationConfig(cudagraph_mode="FULL_AND_PIECEWISE",),
     llm_args = EngineArgs(
         model=model,
+        kv_transfer_config=ktc,
         max_model_len=5000,
         gpu_memory_utilization=0.8,
         max_num_batched_tokens=30000,
