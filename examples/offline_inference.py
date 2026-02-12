@@ -6,8 +6,8 @@ from dataclasses import asdict
 from datetime import datetime
 
 # 指定设备号
-TP_SIZE = 1
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+TP_SIZE = 4
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 os.environ["UNIFIED_CACHE_LOG_LEVEL"] = "INFO"
 
 # Profiler 配置
@@ -49,6 +49,7 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
     llm_args = EngineArgs(
         model=model,
         kv_transfer_config=ktc,
+        tensor_parallel_size=TP_SIZE,
         max_model_len=5000,
         gpu_memory_utilization=0.8,
         max_num_batched_tokens=30000,
@@ -56,6 +57,8 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
         enforce_eager=True,
         trust_remote_code=True,
         enable_prefix_caching=False,
+        mamba_cache_mode="align",
+        disable_hybrid_kv_cache_manager=False,
     )
 
     llm = LLM(**asdict(llm_args))
@@ -152,14 +155,15 @@ def generate_prompt(
 def main():
     module_path = "ucm.integration.vllm.ucm_connector"
     name = "UCMConnector"
-    model = os.getenv("MODEL_PATH", "/home/models/Qwen2.5-14B-Instruct")
+    # model = os.getenv("MODEL_PATH", "/home/models/Qwen2.5-14B-Instruct")
+    model = os.getenv("MODEL_PATH", "/home/models/Qwen3-Next-80B-A3B-Instruct")
 
     tokenizer = AutoTokenizer.from_pretrained(model, use_chat_template=True)
 
     with build_llm_with_uc(module_path, name, model) as llm:
-        prompts_1 = generate_prompt(num_prompts=1, repetitions=3)
-        prompts_2 = generate_prompt(num_prompts=1, repetitions=3, reuse_ratio=0.3, request_id=2)
-        sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=100)
+        prompts_1 = generate_prompt(num_prompts=1, repetitions=30)
+        prompts_2 = generate_prompt(num_prompts=1, repetitions=30, reuse_ratio=1, request_id=2)
+        sampling_params = SamplingParams(temperature=0, top_p=1, max_tokens=50, truncate_prompt_tokens=2050)
 
         if ENABLE_TORCH_PROFILER:
             print("\n[INFO] Starting profiler...")

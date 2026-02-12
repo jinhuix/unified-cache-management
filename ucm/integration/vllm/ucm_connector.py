@@ -4,7 +4,7 @@ import os
 import pickle
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 from vllm.config import VllmConfig
@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.parallel_state import get_tp_group, get_world_group
 from vllm.platforms import current_platform
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -35,21 +37,42 @@ logger = init_logger(__name__)
 
 @dataclass
 class RequestMeta:
-    ucm_block_ids: list[str] = field(default_factory=list)
-    hbm_hit_block_num: int = 0
-    # local_computed_block + external_computed_block
-    total_hit_block_num: int = 0
+    ucm_block_ids_by_group: list[list[str]] = field(default_factory=list)
+    hbm_hit_block_num_by_group: list[int] = field(default_factory=list)
+    total_hit_block_num_by_group: list[int] = field(default_factory=list)
+    vllm_block_ids_by_group: list[list[int]] = field(default_factory=list)
     num_token_ids: int = 0
-    vllm_block_ids: list[int] = field(default_factory=list)
     token_processed: int = 0
+
+    @property
+    def ucm_block_ids(self) -> list[str]:
+        return self.ucm_block_ids_by_group[0] if self.ucm_block_ids_by_group else []
+
+    @property
+    def hbm_hit_block_num(self) -> int:
+        return self.hbm_hit_block_num_by_group[0] if self.hbm_hit_block_num_by_group else 0
+
+    @property
+    def total_hit_block_num(self) -> int:
+        return self.total_hit_block_num_by_group[0] if self.total_hit_block_num_by_group else 0
+
+    @property
+    def vllm_block_ids(self) -> list[int]:
+        return self.vllm_block_ids_by_group[0] if self.vllm_block_ids_by_group else []
 
 
 @dataclass
 class RequestDispatchMeta:
-    load_block_ids: tuple[
-        list[str], list[int]
-    ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
-    dump_block_ids: tuple[list[str], list[int]]
+    load_block_ids_by_group: list[tuple[list[str], list[int]]] = field(default_factory=list)
+    dump_block_ids_by_group: list[tuple[list[str], list[int]]] = field(default_factory=list)
+
+    @property
+    def load_block_ids(self) -> tuple[list[str], list[int]]:
+        return self.load_block_ids_by_group[0] if self.load_block_ids_by_group else ([], [])
+
+    @property
+    def dump_block_ids(self) -> tuple[list[str], list[int]]:
+        return self.dump_block_ids_by_group[0] if self.dump_block_ids_by_group else ([], [])
 
 
 @dataclass
@@ -79,15 +102,22 @@ class RequestHasher:
         return int.from_bytes(h.digest(), byteorder="big")
 
 
-class UCMDirectConnector(KVConnectorBase_V1):
+class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
     """
     This connector means synchronize:
     load -> forward -> save
     """
 
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config=vllm_config, role=role)
-        self.kv_caches: dict[str, torch.Tensor] = {}
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+    ):
+        super().__init__(
+            vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
+        )
+        self.kv_caches: dict[str, Any] = {}
         self.local_rank = (
             -1 if role == KVConnectorRole.SCHEDULER else get_world_group().local_rank
         )
@@ -96,6 +126,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.is_mla = self._vllm_config.model_config.is_deepseek_mla
         self.is_dsa = False
         self.kv_cache_dtype: torch.dtype = None
+        
+        if kv_cache_config is not None and len(kv_cache_config.kv_cache_groups) > 1:
+            self._num_groups = len(kv_cache_config.kv_cache_groups)
+            self._block_sizes = [
+                g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
+            ]
+            self._group_layer_names = [
+                list(g.layer_names) for g in kv_cache_config.kv_cache_groups
+            ]
+        else:
+            self._num_groups = 1
+            self._block_sizes = [self.block_size]
+            self._group_layer_names = None
 
         if current_platform.is_cuda_alike():
             logger.info("CUDA device is available.")
@@ -160,6 +203,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         config["io_size"] = block_size_per_layer * (
             1 if self.is_mla else num_head_per_tp
         )
+        self._store_name = name
+        self._store_config = dict(config)
         self.store = UcmConnectorFactory.create_connector(name, config)
         self.block_data_size = config["kv_block_size"]
 
@@ -214,48 +259,64 @@ class UCMDirectConnector(KVConnectorBase_V1):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
-        assert num_computed_tokens % self.block_size == 0
-        hbm_hit_block_num = num_computed_tokens // self.block_size
+        ucm_block_ids_by_group: list[list[str]] = []
+        hbm_hit_block_num_by_group: list[int] = []
+        total_hit_block_num_by_group: list[int] = []
+        external_hit_tokens_by_group: list[int] = []
 
-        ucm_block_ids = self.generate_hash(self.block_size, request)
+        for g in range(self._num_groups):
+            block_size_g = self._block_sizes[g]
+            hbm_hit_block_num_g = num_computed_tokens // block_size_g
+            ucm_block_ids_g = self.generate_hash(block_size_g, request)
+            
+            ucm_block_ids_by_group.append(ucm_block_ids_g)
+            hbm_hit_block_num_by_group.append(hbm_hit_block_num_g)
 
-        external_block_ids = ucm_block_ids[hbm_hit_block_num:]
-        if not external_block_ids:
-            return 0, False
+            external_block_ids_g = ucm_block_ids_g[hbm_hit_block_num_g:]
+            if not external_block_ids_g:
+                external_hit_tokens_by_group.append(0)
+                total_hit_block_num_by_group.append(hbm_hit_block_num_g)
+                continue
 
-        lookup_results = self.store.lookup(external_block_ids)
-        external_hit_blocks = 0
-        for i, hit in enumerate(lookup_results):
-            if not hit:
-                break
-            external_hit_blocks += 1
-        logger.info(
-            f"request_id: {request.request_id}, "
-            f"total_blocks_num: {len(ucm_block_ids)}, "
-            f"hit hbm: {hbm_hit_block_num}, "
-            f"hit external: {external_hit_blocks}"
+            lookup_results = self.store.lookup(external_block_ids_g)
+            external_hit_blocks_g = sum(1 for hit in itertools.takewhile(lambda x: x, lookup_results))
+            
+            total_hit_block_num_g = hbm_hit_block_num_g + external_hit_blocks_g
+            total_hit_block_num_by_group.append(total_hit_block_num_g)
+            external_hit_tokens_by_group.append(external_hit_blocks_g * block_size_g)
+
+        external_hit_tokens = min(external_hit_tokens_by_group) if external_hit_tokens_by_group else 0
+        num_total_hit_tokens = min(
+            total_hit_block_num_by_group[g] * self._block_sizes[g]
+            for g in range(self._num_groups)
         )
-        if self.metrics_config:
-            self.monitor.update_stats(
-                "ConnStats",
-                {"interval_lookup_hit_rates": external_hit_blocks / len(ucm_block_ids)},
-            )
-
-        total_hit_block_num = hbm_hit_block_num + external_hit_blocks
-
-        external_hit_tokens = external_hit_blocks * self.block_size
-
-        # When all the tokens are cached in ssd or hbm,
-        # we need to recompute the last token. This if condition will be removed
-        # once vLLM scheduler provides a better solution in the future.
-        num_total_hit_tokens = total_hit_block_num * self.block_size
+        
         if num_total_hit_tokens == request.num_tokens:
-            external_hit_tokens -= 1
+            external_hit_tokens = max(0, external_hit_tokens - 1)
+
+        if self._num_groups == 1:
+            logger.info(
+                f"request_id: {request.request_id}, "
+                f"total_blocks: {len(ucm_block_ids_by_group[0])}, "
+                f"hit hbm: {hbm_hit_block_num_by_group[0]}, "
+                f"hit external: {external_hit_tokens // self.block_size}"
+            )
+        else:
+            logger.info(
+                f"request_id: {request.request_id}, num_groups: {self._num_groups}, "
+                f"external_hit_tokens: {external_hit_tokens}"
+            )
+        
+        if self.metrics_config and external_hit_tokens > 0:
+            total_blocks = sum(len(ids) for ids in ucm_block_ids_by_group)
+            hit_rate = external_hit_tokens / request.num_tokens if total_blocks > 0 else 0
+            self.monitor.update_stats("ConnStats", {"interval_lookup_hit_rates": hit_rate})
 
         self.requests_meta[request.request_id] = RequestMeta(
-            ucm_block_ids=ucm_block_ids,
-            hbm_hit_block_num=hbm_hit_block_num,
-            total_hit_block_num=total_hit_block_num,
+            ucm_block_ids_by_group=ucm_block_ids_by_group,
+            hbm_hit_block_num_by_group=hbm_hit_block_num_by_group,
+            total_hit_block_num_by_group=total_hit_block_num_by_group,
+            vllm_block_ids_by_group=[[] for _ in range(self._num_groups)],
             num_token_ids=len(request.all_token_ids),
             token_processed=num_total_hit_tokens,
         )
@@ -271,7 +332,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self,
         req_meta: RequestMeta,
         new_tokens: int,
-        vllm_block_ids: list[int],
+        vllm_block_ids_per_group: tuple[list[int], ...],
         need_load: bool = True,
     ) -> RequestDispatchMeta:
         """
@@ -285,43 +346,75 @@ class UCMDirectConnector(KVConnectorBase_V1):
         ----------------------------------------------------------------------------------------------------
         |                                         scheduled_block_num                                      |
         """
+        load_by_group: list[tuple[list[str], list[int]]] = []
+        dump_by_group: list[tuple[list[str], list[int]]] = []
 
-        hbm_hit_block_num = req_meta.hbm_hit_block_num
-        total_hit_block_num = req_meta.total_hit_block_num
-        ucm_block_ids = req_meta.ucm_block_ids
-        req_meta.vllm_block_ids.extend(vllm_block_ids)
+        for g in range(self._num_groups):
+            block_size_g = self._block_sizes[g]
+            ucm_block_ids_g = req_meta.ucm_block_ids_by_group[g]
+            vllm_block_ids_g = vllm_block_ids_per_group[g]
+            req_meta.vllm_block_ids_by_group[g].extend(vllm_block_ids_g)
 
-        load_ucm_block_ids, load_vllm_block_ids = [], []
-        dump_ucm_block_ids, dump_vllm_block_ids = [], []
-        if need_load:
-            load_ucm_block_ids = ucm_block_ids[hbm_hit_block_num:total_hit_block_num]
-            load_vllm_block_ids = vllm_block_ids[hbm_hit_block_num:total_hit_block_num]
+            hbm_hit_g = req_meta.hbm_hit_block_num_by_group[g]
+            total_hit_g = req_meta.total_hit_block_num_by_group[g]
 
-        if req_meta.token_processed < req_meta.num_token_ids:
-            start_idx = req_meta.token_processed // self.block_size
-            end_idx = (req_meta.token_processed + new_tokens) // self.block_size
-            dump_ucm_block_ids = ucm_block_ids[start_idx:end_idx]
-            dump_vllm_block_ids = req_meta.vllm_block_ids[start_idx:end_idx]
+            load_ucm_g = ucm_block_ids_g[hbm_hit_g:total_hit_g] if need_load else []
+            load_vllm_g = vllm_block_ids_g[hbm_hit_g:total_hit_g] if need_load else []
+
+            if req_meta.token_processed < req_meta.num_token_ids:
+                start_idx = req_meta.token_processed // block_size_g
+                end_idx = (req_meta.token_processed + new_tokens) // block_size_g
+                dump_ucm_g = ucm_block_ids_g[start_idx:end_idx]
+                dump_vllm_g = req_meta.vllm_block_ids_by_group[g][start_idx:end_idx]
+            else:
+                dump_ucm_g, dump_vllm_g = [], []
+
+            load_by_group.append((load_ucm_g, load_vllm_g))
+            dump_by_group.append((dump_ucm_g, dump_vllm_g))
+
+        if new_tokens > 0:
             req_meta.token_processed += new_tokens
 
         return RequestDispatchMeta(
-            (load_ucm_block_ids, load_vllm_block_ids),
-            (dump_ucm_block_ids, dump_vllm_block_ids),
+            load_block_ids_by_group=load_by_group,
+            dump_block_ids_by_group=dump_by_group,
         )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         requests_dispatch_meta = {}
-        # for new request, we need to load and dump
+        
+        def normalize_block_ids(block_ids) -> tuple[list[int], ...]:
+            if block_ids is None:
+                return tuple([] for _ in range(self._num_groups))
+            if isinstance(block_ids, tuple):
+                if len(block_ids) == self._num_groups:
+                    return block_ids
+                if self._num_groups == 1:
+                    return (block_ids[0],) if block_ids else ([],)
+                if len(block_ids) == 1:
+                    logger.warning(f"Got single-element tuple for {self._num_groups}-group model, broadcasting")
+                    return tuple(block_ids[0] for _ in range(self._num_groups))
+                logger.error(f"Tuple length {len(block_ids)} != num_groups {self._num_groups}")
+                return tuple([] for _ in range(self._num_groups))
+            
+            if isinstance(block_ids, list):
+                if self._num_groups == 1:
+                    return (block_ids,)
+                return tuple(block_ids for _ in range(self._num_groups))
+            
+            logger.error(f"Unexpected block_ids type: {type(block_ids)}")
+            return tuple([] for _ in range(self._num_groups))
+
         for request in scheduler_output.scheduled_new_reqs:
-            request_id, vllm_block_ids = request.req_id, request.block_ids[0]
+            request_id, vllm_block_ids = request.req_id, request.block_ids
             req_meta = self.requests_meta.get(request_id)
             if req_meta:
                 requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
-                    vllm_block_ids,
+                    normalize_block_ids(vllm_block_ids),
                 )
 
         # for cached request, there are 3 situation:
@@ -336,12 +429,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 if req_meta:
                     new_block_ids = []
                     if scheduled_cached_reqs.new_block_ids[i] != None:
-                        new_block_ids = scheduled_cached_reqs.new_block_ids[i][0]
+                        new_block_ids = scheduled_cached_reqs.new_block_ids[i]
                     requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
                         req_meta,
                         scheduler_output.num_scheduled_tokens[request_id],
-                        new_block_ids,
-                        scheduled_cached_reqs.resumed_from_preemption[i],
+                        normalize_block_ids(new_block_ids),
+                        need_load=(request_id in scheduled_cached_reqs.resumed_req_ids),
                     )
         else:
             for request in scheduled_cached_reqs:
@@ -351,8 +444,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
                         req_meta,
                         scheduler_output.num_scheduled_tokens[request_id],
-                        request.new_block_ids[0],
-                        request.resumed_from_preemption,
+                        normalize_block_ids(request.new_block_ids),
+                        need_load=request.resumed_from_preemption,
                     )
 
         # clear finished request
@@ -379,11 +472,14 @@ class UCMDirectConnector(KVConnectorBase_V1):
         # which works but leads to space inefficiency.
         # TODO: Optimize this to avoid unnecessary space usage.
         sample_kv_layer = next(iter(self.kv_caches.values()))
-        if self.is_mla and len(sample_kv_layer) == 2:
+        if self.is_mla and len(sample_kv_layer) == 2 and isinstance(sample_kv_layer, (list, tuple)) :
             self.is_mla = False
             self.is_dsa = True
         if self.kv_cache_dtype is None:
-            self.kv_cache_dtype = sample_kv_layer[0].dtype
+            if isinstance(sample_kv_layer, torch.Tensor):
+                self.kv_cache_dtype = sample_kv_layer.dtype
+            else:
+                self.kv_cache_dtype = sample_kv_layer[0].dtype
 
     @staticmethod
     def _extract_layer_index(layer_name: str) -> Optional[int]:
@@ -395,66 +491,157 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 return int(chunk)
         return None
 
+    @staticmethod
+    def _get_block_view_for_layer(kv_cache_obj: Any, block_id: int) -> list[torch.Tensor]:
+        if isinstance(kv_cache_obj, torch.Tensor):
+            if kv_cache_obj.dim() >= 3 and kv_cache_obj.shape[0] == 2:
+                if block_id >= kv_cache_obj.shape[1]:
+                    raise IndexError(
+                        f"block_id {block_id} out of range for {kv_cache_obj.shape[1]} blocks"
+                    )
+                return [kv_cache_obj[0, block_id], kv_cache_obj[1, block_id]]
+            if kv_cache_obj.dim() >= 3 and kv_cache_obj.shape[1] == 2:
+                if block_id >= kv_cache_obj.shape[0]:
+                    raise IndexError(
+                        f"block_id {block_id} out of range for {kv_cache_obj.shape[0]} blocks"
+                    )
+                return [kv_cache_obj[block_id, 0], kv_cache_obj[block_id, 1]]
+            return [kv_cache_obj[block_id]]
+
+        if isinstance(kv_cache_obj, (list, tuple)):
+            return [t[block_id] for t in kv_cache_obj]
+
+        raise TypeError(f"Unsupported kv_cache type: {type(kv_cache_obj)}")
+
     def _precompute_layer_offsets(self):
         if not self.kv_caches:
             return
 
-        sample_kv_layer = next(iter(self.kv_caches.values()))
-        elem_size = sample_kv_layer[0].element_size()
-        block_data_size = (
-            sample_kv_layer[0].numel() if self.is_mla else sample_kv_layer[0][0].numel()
-        ) * elem_size
-        layer_data_size = block_data_size if self.is_mla else block_data_size * 2
+        offset = 0
 
-        # precompute all layers offset
-        for layer_name, _ in self.kv_caches.items():
-            layer_id = self._extract_layer_index(layer_name)
-            assert layer_id is not None
-            k_offset = layer_data_size * layer_id
-            v_offset = k_offset + block_data_size if not self.is_mla else 0
-            self._layer_offset_cache[layer_name] = (k_offset, v_offset)
+        def _layer_sort_key(ln: str) -> tuple[int, str]:
+            idx = self._extract_layer_index(ln)
+            return (idx if idx is not None else 10**9, ln)
+
+        for layer_name in sorted(self.kv_caches.keys(), key=_layer_sort_key):
+            kv_cache_obj = self.kv_caches[layer_name]
+            block_views = self._get_block_view_for_layer(kv_cache_obj, 0)
+            layer_offsets: list[int] = []
+            for view in block_views:
+                layer_offsets.append(offset)
+                offset += view.numel() * view.element_size()
+            if len(layer_offsets) == 2:
+                self._layer_offset_cache[layer_name] = tuple(layer_offsets)
+            elif len(layer_offsets) == 1:
+                self._layer_offset_cache[layer_name] = (layer_offsets[0], 0)
+            else:
+                self._layer_offset_cache[layer_name] = layer_offsets
+
+        self.block_data_size = offset
+        if (
+            getattr(self, "_store_config", None) is not None
+            and self.role == KVConnectorRole.WORKER
+            and self.block_data_size > int(self._store_config.get("kv_block_size", 0))
+        ):
+            new_cfg = dict(self._store_config)
+            new_cfg["kv_block_size"] = int(self.block_data_size)
+            new_cfg["io_size"] = int(min(new_cfg.get("io_size", self.block_data_size), self.block_data_size))
+            logger.info(
+                "[UCM] resize kv_block_size %s -> %s for hybrid/state support",
+                self._store_config.get("kv_block_size"),
+                new_cfg["kv_block_size"],
+            )
+            self._store_config = new_cfg
+            self.store = UcmConnectorFactory.create_connector(self._store_name, new_cfg)
 
     def _get_tensor_and_offset(
-        self, vllm_block_ids: list[int], kv_layer: torch.Tensor, layer_name: str
+        self, vllm_block_ids: list[int], kv_layer: Any, layer_name: str
     ) -> tuple[list[torch.Tensor], list[int]]:
         """
         GQA/MHA: one layer shape is (2, num_blocks, block_size, num_kv_heads, head_size)
         MLA: one layer shape is (num_blocks, block_size, head_size)
         """
-        k_tensors, k_offsets = [], []
-        v_tensors, v_offsets = [], []
-        k_offset, v_offset = self._layer_offset_cache[layer_name]
+        layer_offsets = self._layer_offset_cache[layer_name]
 
+        if isinstance(layer_offsets, tuple):
+            if not vllm_block_ids:
+                return [], []
+
+            first_views = self._get_block_view_for_layer(kv_layer, vllm_block_ids[0])
+            if len(first_views) == 2:
+                k_tensors: list[torch.Tensor] = []
+                v_tensors: list[torch.Tensor] = []
+                for vllm_block_id in vllm_block_ids:
+                    views = self._get_block_view_for_layer(kv_layer, vllm_block_id)
+                    k_tensors.append(views[0])
+                    v_tensors.append(views[1])
+                k_off = layer_offsets[0]
+                v_off = layer_offsets[1] if len(layer_offsets) > 1 else layer_offsets[0]
+                return (
+                    k_tensors + v_tensors,
+                    [k_off] * len(k_tensors) + [v_off] * len(v_tensors),
+                )
+
+            tensors = [self._get_block_view_for_layer(kv_layer, bid)[0] for bid in vllm_block_ids]
+            return tensors, [layer_offsets[0]] * len(tensors)
+
+        tensors: list[torch.Tensor] = []
+        offsets: list[int] = []
         for vllm_block_id in vllm_block_ids:
-            k_tensors.append(
-                kv_layer[vllm_block_id] if self.is_mla else kv_layer[0][vllm_block_id]
-            )
-            k_offsets.append(k_offset)
-            if not self.is_mla:
-                v_tensors.append(kv_layer[1][vllm_block_id])
-                v_offsets.append(v_offset)
-        return k_tensors + v_tensors, k_offsets + v_offsets
+            block_views = self._get_block_view_for_layer(kv_layer, vllm_block_id)
+            tensors.extend(block_views)
+            offsets.extend(layer_offsets[: len(block_views)])
 
-    def _generate_task(self, vllm_block_ids: List[int], ucm_block_ids: List[str]):
+        # Reorder from [b0_s0,b0_s1,b1_s0,b1_s1,...] to [all_s0_blocks, all_s1_blocks,...]
+        num_states = len(layer_offsets)
+        if num_states > 1 and vllm_block_ids:
+            per_state_tensors: list[list[torch.Tensor]] = [[] for _ in range(num_states)]
+            for vllm_block_id in vllm_block_ids:
+                views = self._get_block_view_for_layer(kv_layer, vllm_block_id)
+                for i in range(min(num_states, len(views))):
+                    per_state_tensors[i].append(views[i])
+            tensors = []
+            offsets = []
+            for i in range(num_states):
+                tensors.extend(per_state_tensors[i])
+                offsets.extend([layer_offsets[i]] * len(per_state_tensors[i]))
+
+        return tensors, offsets
+
+    def _generate_task(
+        self,
+        vllm_block_ids: List[int],
+        ucm_block_ids: List[str],
+        layer_names: Optional[List[str]] = None,
+    ):
         if not self._layer_offset_cache:
             self._precompute_layer_offsets()
 
-        num_layers = len(self.kv_caches)
-        num_blocks_per_layer = len(vllm_block_ids)
-        num_tensors_per_layer = num_blocks_per_layer * (1 if self.is_mla else 2)
-        dst_tensor_addr = [None] * (num_layers * num_tensors_per_layer)
-        ucm_offsets = [0] * (num_layers * num_tensors_per_layer)
+        dst_tensor_addr: list[torch.Tensor] = []
+        ucm_offsets: list[int] = []
 
-        idx = 0
-        for layer_name, one_layer_kv_cache in self.kv_caches.items():
-            tensors, offsets = self._get_tensor_and_offset(
-                vllm_block_ids, one_layer_kv_cache, layer_name
+        def _layer_sort_key(ln: str) -> tuple[int, str]:
+            idx = self._extract_layer_index(ln)
+            return (idx if idx is not None else 10**9, ln)
+
+        keys = (
+            sorted(
+                (ln for ln in (layer_names or []) if ln in self.kv_caches),
+                key=_layer_sort_key,
             )
-            dst_tensor_addr[idx : idx + len(tensors)] = tensors
-            ucm_offsets[idx : idx + len(offsets)] = offsets
-            idx += len(tensors)
+            if layer_names is not None
+            else sorted(self.kv_caches.keys(), key=_layer_sort_key)
+        )
+        for layer_name in keys:
+            one_layer_kv_cache = self.kv_caches[layer_name]
+            tensors, offsets = self._get_tensor_and_offset(vllm_block_ids, one_layer_kv_cache, layer_name)
+            dst_tensor_addr.extend(tensors)
+            ucm_offsets.extend(offsets)
 
-        repeat_times = len(self.kv_caches) * (1 if self.is_mla else 2)
+        if not ucm_block_ids:
+            return [], [], []
+
+        repeat_times = len(ucm_offsets) // len(ucm_block_ids)
         ucm_total_block_ids = ucm_block_ids * repeat_times
 
         assert len(ucm_total_block_ids) == len(ucm_offsets) == len(dst_tensor_addr)
@@ -485,44 +672,44 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
         self._init_kv_caches_from_forward_context(forward_context)
 
-        request_to_task: dict[str, Optional[Task]] = {}
-        req_broadcast_addr = {}
-        is_load = False
+        load_tasks: list[tuple[str, Optional[Task], list[torch.Tensor], list[int]]] = []
         num_loaded_block = 0
         num_loaded_request = 0
         load_start_time = time.perf_counter() * 1000
         for request_id, request in metadata.request_meta.items():
-            if len(request.load_block_ids[0]) == 0:
-                continue
-            is_load = True
-            num_loaded_block += len(request.load_block_ids[0])
-            num_loaded_request += 1
-
-            ucm_block_ids, vllm_block_ids = request.load_block_ids
-            if self.global_rank != 0 and not self.is_mla and not self.is_dsa:
-                for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = str(self.request_hasher(ucm_block_id))
-            ucm_total_block_ids, ucm_offsets, dst_tensor_addr = self._generate_task(
-                vllm_block_ids, ucm_block_ids
-            )
-            if self.global_rank == 0 or not self.load_only_first_rank:
-                request_to_task[request_id] = self.store.load(
-                    ucm_total_block_ids, ucm_offsets, dst_tensor_addr
+            req_had_load = False
+            for g, (load_ucm, load_vllm) in enumerate(request.load_block_ids_by_group):
+                if not load_ucm:
+                    continue
+                
+                req_had_load = True
+                num_loaded_block += len(load_ucm)
+                
+                ucm_block_ids = list(load_ucm)
+                if self.global_rank != 0 and not self.is_mla and not self.is_dsa:
+                    ucm_block_ids = [str(self.request_hasher(uid)) for uid in ucm_block_ids]
+                
+                layer_names = self._group_layer_names[g] if self._group_layer_names else None
+                ucm_total_ids, offsets, dst_addrs = self._generate_task(
+                    list(load_vllm), ucm_block_ids, layer_names=layer_names
                 )
-            else:
-                request_to_task[request_id] = None
-            req_broadcast_addr[request_id] = dst_tensor_addr
+                
+                task = None
+                if self.global_rank == 0 or not self.load_only_first_rank:
+                    task = self.store.load(ucm_total_ids, offsets, dst_addrs)
+                load_tasks.append((request_id, task, dst_addrs, list(load_vllm)))
+            
+            if req_had_load:
+                num_loaded_request += 1
 
-        for request_id, task in request_to_task.items():
+        for request_id, task, dst_addrs, vllm_ids in load_tasks:
             # TODO error handling
             if self.global_rank == 0 or not self.load_only_first_rank:
                 if self.store.wait(task) != 0:
-                    self._invalid_block_ids.update(
-                        metadata.request_meta[request_id].load_block_ids[1]
-                    )
+                    self._invalid_block_ids.update(vllm_ids)
                     logger.error(f"request {request_id} load kv cache failed.")
-            if self.load_only_first_rank:
-                self._broadcast(req_broadcast_addr[request_id])
+            if self.load_only_first_rank and dst_addrs:
+                self._broadcast(dst_addrs)
         load_end_time = time.perf_counter() * 1000
         load_speed = (
             num_loaded_block
@@ -531,7 +718,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             / 1024
             / 1024
         )  # GB/s
-        if self.metrics_config and is_load:
+        if self.metrics_config and num_loaded_block > 0:
             self.monitor.update_stats(
                 "ConnStats",
                 {
@@ -567,47 +754,41 @@ class UCMDirectConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
-        request_to_task: dict[str, Task] = {}
-        request_to_blocks: dict[str, list[str]] = {}
-        is_save = False
+        save_tasks: list[tuple[str, Task, list[str]]] = []
         num_saved_block = 0
         num_saved_request = 0
         save_start_time = time.perf_counter() * 1000
         for request_id, request in metadata.request_meta.items():
-            if len(request.dump_block_ids[0]) == 0:
-                continue
-            is_save = True
-            num_saved_block += len(request.dump_block_ids[0])
-            num_saved_request += 1
+            req_had_save = False
+            for g, (dump_ucm, dump_vllm) in enumerate(request.dump_block_ids_by_group):
+                if not dump_ucm:
+                    continue
+                
+                req_had_save = True
+                num_saved_block += len(dump_ucm)
+                
+                ucm_block_ids = list(dump_ucm)
+                if self.global_rank != 0:
+                    ucm_block_ids = [str(self.request_hasher(uid)) for uid in ucm_block_ids]
+                
+                rets = self.store.create(ucm_block_ids)
+                end = next((i for i, ret in enumerate(rets) if ret != 0), len(rets))
+                if end == 0:
+                    logger.error(f"create blocks for {request_id} group {g} failed")
+                    continue
+                ucm_block_ids = ucm_block_ids[:end]
+                
+                layer_names = self._group_layer_names[g] if self._group_layer_names else None
+                ucm_total_ids, offsets, src_addrs = self._generate_task(
+                    list(dump_vllm[:end]), ucm_block_ids, layer_names=layer_names
+                )
+                task = self.store.dump(ucm_total_ids, offsets, src_addrs)
+                save_tasks.append((request_id, task, ucm_block_ids))
+            
+            if req_had_save:
+                num_saved_request += 1
 
-            ucm_block_ids, vllm_block_ids = request.dump_block_ids
-            if self.global_rank != 0:
-                for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = str(self.request_hasher(ucm_block_id))
-            rets = self.store.create(ucm_block_ids)
-            end = 0
-            for i, ret in enumerate(rets):
-                if ret != 0:
-                    logger.error(
-                        f"create blocks for {request_id} failed, block index: {i}, ret code: {ret}"
-                    )
-                    break
-                end += 1
-
-            if end == 0:
-                continue
-            ucm_block_ids = ucm_block_ids[:end]
-            vllm_block_ids = vllm_block_ids[:end]
-            ucm_total_block_ids, ucm_offsets, dst_tensor_addr = self._generate_task(
-                vllm_block_ids, ucm_block_ids
-            )
-            request_to_task[request_id] = self.store.dump(
-                ucm_total_block_ids, ucm_offsets, dst_tensor_addr
-            )
-            request_to_blocks[request_id] = ucm_block_ids
-
-        for request_id, task in request_to_task.items():
-            ucm_block_ids = request_to_blocks[request_id]
+        for request_id, task, ucm_block_ids in save_tasks:
             if self.store.wait(task) == 0:
                 self.store.commit(ucm_block_ids, True)
             else:
@@ -621,7 +802,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             / 1024
             / 1024
         )  # GB/s
-        if self.metrics_config and is_save:
+        if self.metrics_config and num_saved_block > 0:
             self.monitor.update_stats(
                 "ConnStats",
                 {
@@ -647,6 +828,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self._invalid_block_ids = set()
         return res
 
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return False, None
+
 
 class UCMLayerWiseConnector(UCMDirectConnector):
     """
@@ -656,8 +844,13 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                              load l2    -> forward l2 -> save l2
     """
 
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config, role)
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
         self.layerwise_load_tasks: dict[str, dict[str, Task]] = {}
         self.layerwise_dump_tasks: dict[str, dict[str, list[Task]]] = {}
         self.created_blocks: set[str] = set()
@@ -838,8 +1031,13 @@ class UCMMockConnector(UCMDirectConnector):
     will reduce hit_tokens under the hit_ratio you set.
     """
 
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config, role)
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
         self._hit_ratio = float(self.launch_config["hit_ratio"])
         logger.info(f"hit_ratio: {self._hit_ratio}")
 
@@ -870,8 +1068,13 @@ class UCMMockConnector(UCMDirectConnector):
         return expect_hit_block_num * self.block_size, False
 
 
-class UCMConnector(KVConnectorBase_V1):
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
+class UCMConnector(KVConnectorBase_V1, SupportsHMA):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+    ):
         super().__init__(vllm_config=vllm_config, role=role)
         self.connector: KVConnectorBase_V1
         
@@ -884,13 +1087,13 @@ class UCMConnector(KVConnectorBase_V1):
         launch_config = ucm_config.get_config()
         
         if "hit_ratio" in extra_config or "hit_ratio" in launch_config:
-            self.connector = UCMMockConnector(vllm_config, role)
+            self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
             logger.info("Using UCMMockConnector for hit ratio testing")
         elif extra_config.get("use_layerwise", False) or launch_config.get("use_layerwise", False):
-            self.connector = UCMLayerWiseConnector(vllm_config, role)
+            self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
             logger.info("Using UCMLayerWiseConnector for layer-wise pipelining")
         else:
-            self.connector = UCMDirectConnector(vllm_config, role)
+            self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
             logger.info("Using UCMDirectConnector for synchronous mode")
 
     def get_num_new_matched_tokens(
@@ -1025,3 +1228,10 @@ class UCMConnector(KVConnectorBase_V1):
             Empty set if no load errors occurred.
         """
         return self.connector.get_block_ids_with_load_errors()
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return False, None
