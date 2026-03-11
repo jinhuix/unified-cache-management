@@ -21,6 +21,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
+import ctypes
 import json
 import threading
 from dataclasses import dataclass, field
@@ -117,10 +118,9 @@ class UcmDramStore(UcmKVStoreBaseV1):
         self.kv_block_size = int(config.get("block_size") or config.get("kv_block_size") or 0)
         self.max_cache_size = int(config.get("max_cache_size", 5368709120))  # Default 5GB
         self.tensor_size_list: List[int] = [int(x) for x in (config.get("tensor_size_list") or [])]
-        self.segment_offsets = np.cumsum(np.asarray([0] + self.tensor_size_list[:-1], dtype=np.uint64))
-        
-        # Local DRAM storage with pin_memory
-        self.storage: Dict[str, torch.Tensor] = {}
+        self._layer_buffers: List[Optional[torch.Tensor]] = []
+        self.block_num: int = 0
+
         # ZMQ setup
         self.coordinator = DramStoreCoordinator(self.role, zmq_addr="tcp://127.0.0.1:5555")
 
@@ -192,18 +192,18 @@ class UcmDramStore(UcmKVStoreBaseV1):
                 elif len(self._pinned_pool.get(size, [])) < 8:
                     self._pinned_pool.setdefault(size, []).append(buf)
 
-    def _ensure_blocks(self, block_keys: List[str]) -> None:
-        missing = [k for k in block_keys if k not in self.storage]
-        if not missing:
+    def _ensure_layer_buffers(self, n_blocks: int) -> None:
+        if not self.tensor_size_list:
             return
-        if self.kv_block_size <= 0:
-            raise RuntimeError("UcmDramStore requires 'block_size' (> 0) to allocate buffers.")
-        buffers = self._get_pinned(self.kv_block_size, len(missing))
-        for key, buf in zip(missing, buffers):
-            if key not in self.storage:
-                self.storage[key] = buf
-            else:
-                self._put_pinned(buf)
+        n_segments = len(self.tensor_size_list)
+        if n_blocks == self.block_num and len(self._layer_buffers) == n_segments:
+            return
+        self._layer_buffers.clear()
+        self.block_num = n_blocks
+        for i in range(n_segments):
+            seg_size = n_blocks * self.tensor_size_list[i]
+            buf = torch.empty(seg_size, dtype=torch.uint8, pin_memory=True)
+            self._layer_buffers.append(buf)
 
     def cc_store(self) -> int:
         return 0
@@ -245,25 +245,24 @@ class UcmDramStore(UcmKVStoreBaseV1):
         shard_index: List[int],
         dst_addr: List[List[int]] | np.ndarray,
     ) -> Task:
+        keys = [self._key(b) for b in block_ids]
+        task = DramTask(stream=self._trans_stream, op="load", block_ids=keys)
         if not self.tensor_size_list:
             task.done = True
             return task
 
-        keys = [self._key(b) for b in block_ids]
         dev_ptrs = np.asarray(dst_addr, dtype=np.uint64)
-        task = DramTask(stream=self._trans_stream, op="load", block_ids=keys)
-        host_base = np.asarray([self.storage[k].data_ptr() for k in keys], dtype=np.uint64)
+        n_blocks = len(keys)
+        self._ensure_layer_buffers(n_blocks)
         sizes = np.asarray(self.tensor_size_list, dtype=np.uint64)
-        offsets = self.segment_offsets.astype(np.uint64, copy=False)
 
-        for size in np.unique(sizes):
-            idx = np.where(sizes == size)[0]
-            if idx.size == 0:
-                continue
-            host_ptrs = (host_base[:, None] + offsets[None, idx]).reshape(-1)
-            device_ptrs = dev_ptrs[:, idx].reshape(-1)
-            self._trans_stream.HostToDeviceBatchAsync(
-                host_ptrs, device_ptrs, int(size), int(host_ptrs.size)
+        for i in range(len(self.tensor_size_list)):
+            size_per_block = int(sizes[i])
+            total_size = n_blocks * size_per_block
+            host_base_L = np.uintp(self._layer_buffers[i].data_ptr())
+            device_base_L = np.uintp(dev_ptrs[i])
+            self._trans_stream.HostToDeviceAsync(
+                host_base_L, device_base_L, total_size
             )
 
         return task
@@ -274,37 +273,31 @@ class UcmDramStore(UcmKVStoreBaseV1):
         shard_index: List[int],
         src_addr: List[List[int]] | np.ndarray,
     ) -> Task:
+        keys = [self._key(b) for b in block_ids]
+        task = DramTask(stream=self._trans_stream, op="dump", block_ids=keys)
         if not self.tensor_size_list:
             task.done = True
             return task
 
-        keys = [self._key(b) for b in block_ids]
-        newly_allocated = [k for k in keys if k not in self.storage]
-        self._ensure_blocks(keys)
+        n_blocks = len(keys)
+        self._ensure_layer_buffers(n_blocks)
         dev_ptrs = np.asarray(src_addr, dtype=np.uint64)
-        task = DramTask(stream=self._trans_stream, op="dump", block_ids=keys)
-        host_base = np.asarray([self.storage[k].data_ptr() for k in keys], dtype=np.uint64)
         sizes = np.asarray(self.tensor_size_list, dtype=np.uint64)
-        offsets = self.segment_offsets.astype(np.uint64, copy=False)
 
         try:
-            for size in np.unique(sizes):
-                idx = np.where(sizes == size)[0]
-                if idx.size == 0:
-                    continue
-                host_ptrs = (host_base[:, None] + offsets[None, idx]).reshape(-1)
-                device_ptrs = dev_ptrs[:, idx].reshape(-1)
-                self._trans_stream.DeviceToHostBatchAsync(
-                    device_ptrs, host_ptrs, int(size), int(host_ptrs.size)
+            # 每层：单次连续拷贝，从 device_base_L 搬移整层 n_blocks*sizes[i] 字节到 host_base_L
+            for i in range(len(self.tensor_size_list)):
+                size_per_block = int(sizes[i])
+                total_size = n_blocks * size_per_block
+                host_base_L = self._layer_buffers[i].data_ptr()
+                device_base_L = int(dev_ptrs[i])
+
+                self._trans_stream.DeviceToHostAsync(
+                    device_base_L, host_base_L, total_size
                 )
         except Exception as e:
             task.status = -1
-            for bid in newly_allocated:
-                buf = self.storage.pop(bid, None)
-                if buf is not None:
-                    self._put_pinned(buf)
             raise RuntimeError(f"DRAM dump_data failed: {e}") from e
-
         return task
 
     def wait(self, task: Task) -> None:
