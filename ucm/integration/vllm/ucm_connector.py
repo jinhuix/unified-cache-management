@@ -613,6 +613,22 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 }
             )
 
+        if is_load == True and torch.distributed.get_rank() == 0:
+            layer_name = "model.layers.0.linear_attn"
+            print("---------------------[load]self.kv_caches[model.layers.44.linear_attn][1]:-------------------------")
+            print(self.kv_caches[layer_name][0][1])
+            print("---------------------[load]self.kv_caches[model.layers.44.linear_attn][15]:-------------------------")
+            print(self.kv_caches[layer_name][0][15])
+
+            layer_name = "model.layers.47.self_attn.attn"
+            print("---------------------[load]self.kv_caches[model.layers.47.self_attn.attn][4]:-------------------------\n")
+            print("\n")
+            print(self.kv_caches[layer_name][0][4])
+            layer_name = "model.layers.47.self_attn.attn"
+            print("---------------------[load]self.kv_caches[model.layers.47.self_attn.attn][18]:-------------------------\n")
+            print(self.kv_caches[layer_name][0][18])
+            
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
 
