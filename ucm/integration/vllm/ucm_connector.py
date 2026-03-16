@@ -66,50 +66,79 @@ class RequestDispatchMeta:
 class KVCacheLayout:
     def __init__(self, kvcaches, use_layerwise: bool, group_size: int, tensor_sizes: int) -> None:
         # each row is a layer, each column is a tensor_size/ptr in the layer (e.g., k, v, rope, k_index)
-        self.base_ptrs: np.ndarray  # (n_layers）
+        self.base_ptrs: np.ndarray  # (n_layers, n_ptrs）
         self.tensor_size_lists: np.ndarray  # (n_layers, n_tensor_sizes)
         self.tensor_sizes = tensor_sizes
         self.group_size = group_size
+        self.group_num = len(kvcaches) // self.group_size
         self.use_layerwise = use_layerwise
         self._build_layout(kvcaches)
 
     def _build_layout(self, kvcaches):
-        base_ptrs = []
-        flag = False
+        raw_ptr_rows = []
+        stride_rows = []
 
         for idx, (_, kv_layer) in enumerate(kvcaches.items()):
             if idx >= self.group_size:
                 break
+            ptrs = []
+            strides = []
+
+            def handle_tensor(t: torch.Tensor, size_dims):
+                ptrs.append(t[0].data_ptr())
+
+                stride = math.prod([t.shape[i] for i in size_dims]) * t.element_size()
+                strides.append(stride)
 
             if isinstance(kv_layer, torch.Tensor):
                 if kv_layer.dim() == 5:
                     # [2, num_blocks, block_size, num_head, head_dim]
-                    base_ptrs.append(kv_layer[0].data_ptr())
-                    base_ptrs.append(kv_layer[1].data_ptr())
-                    flag = True
+                    handle_tensor(kv_layer[0], (-3, -2, -1))
+                    handle_tensor(kv_layer[1], (-3, -2, -1))
+                elif kv_layer.dim() == 3:
+                    # [num_blocks, block_size, head_dim]
+                    handle_tensor(kv_layer, (-2, -1))
                 else:
                     raise ValueError(
                         f"Unsupported kv cache tensor shape: {kv_layer.shape}"
                     )
-            elif isinstance(kv_layer, (Tuple, list)):
+            elif isinstance(kv_layer, Tuple):
                 # vllm_ascend >= 0.10.0, ([num_blocks, block_size, num_head, head_dim], ...)
-                base_ptrs.append(kv_layer[0].data_ptr())
+                for tensor in kv_layer:
+                    handle_tensor(tensor, (-3, -2, -1))
+            elif isinstance(kv_layer, list):
+                ptrs = [kv_layer[0].data_ptr()]
+                strides = [self.tensor_sizes]
             else:
                 raise TypeError(f"Unsupported kv cache type: {type(kv_layer)}")
 
-        if flag:
-            self.tensor_sizes = self.tensor_sizes // 2
-        self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
-        self.tensor_size_lists = [self.tensor_sizes] * len(self.base_ptrs)
+            raw_ptr_rows.append(ptrs)
+            stride_rows.append(strides)
 
-    def extract_base_addrs(self, vllm_block_ids: List[int]) -> np.ndarray:
-        # 返回：base_ptrs的每一行+tensor_size_lists每一行*vllm_block_ids[0]
-        tensor_sizes = np.asarray(self.tensor_size_lists, dtype=np.uint64)
-        return self.base_ptrs + tensor_sizes * vllm_block_ids[0]
+        self.base_ptrs = np.asarray(raw_ptr_rows, dtype=np.uint64)
+        self.tensor_size_lists = np.asarray(stride_rows, dtype=np.uint64)
+
+        logger.info(
+            f"base_ptrs: {self.base_ptrs.shape}, tensor_size_lists: {self.tensor_size_lists.shape}"
+        )
+
+    def extract_block_addrs(self, vllm_block_ids: List[int], is_load: bool) -> np.ndarray:
+        vllm_block_ids_np = np.array(vllm_block_ids, np.uint64)
+        if is_load and self.group_num > 1:
+            vllm_block_ids_np[:self.group_num-1] += np.uint64(len(vllm_block_ids))
+        block_addrs = (
+            vllm_block_ids_np[:, None, None] * self.tensor_size_lists[None, :, :]
+            + self.base_ptrs[None, :, :]
+        )  # (num_blocks, n_layers, n_ptrs)
+        return block_addrs
 
     @property
     def tensor_size_list(self) -> list[int]:
-        return self.tensor_size_lists
+        return (
+            self.tensor_size_lists.reshape(-1).tolist()
+            if not self.use_layerwise
+            else self.tensor_size_lists[0].tolist()
+        )
 
     @property
     def shard_size(self) -> int:
@@ -121,7 +150,7 @@ class KVCacheLayout:
 
     @property
     def block_size(self) -> int:
-        return int(self.tensor_sizes * len(self.base_ptrs))
+        return int(self.tensor_size_lists.sum())
 
 
 @dataclass
@@ -328,6 +357,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             config["tensor_size_list"] = (
                 kv_cache_layout.tensor_size_list * self.blocks_per_chunk
             )
+            config["shard_size"] = kv_cache_layout.shard_size * self.blocks_per_chunk
             config["block_size"] = kv_cache_layout.block_size * self.blocks_per_chunk
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
         logger.info(f"create {name} with config: {config}")
@@ -378,11 +408,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             external_hit_blocks = 0
             logger.error(f"request {request.request_id} look up error. {e}")
         ucm_ids_hex = [b.hex() for b in external_block_ids]
-        logger.info(
-            f"[UCM lookup] request_id={request.request_id}, "
-            f"total_blocks_num={len(base_hash_ids)}, hit_hbm={hbm_hit_block_num}, hit_external={external_hit_blocks}, "
-            f"ucm_ids={ucm_ids_hex}, vllm_block_range=[{hbm_hit_block_num}:{len(base_hash_ids)}]"
-        )
         if self.metrics_config:
             ucmmetrics.update_stats(
                 {"interval_lookup_hit_rates": external_hit_blocks / len(base_hash_ids)},
@@ -575,10 +600,11 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             if self.tp_rank != 0 and not self.is_mla:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+            total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids, True)
+            total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
             shard_indexs = [0] * len(ucm_block_ids)
             try:
-                logger.info(f"vllm_block_ids: {vllm_block_ids}")
-                task = self.store.load_data(ucm_block_ids, shard_indexs, self.kv_cache_layout.extract_base_addrs(vllm_block_ids))
+                task = self.store.load_data(ucm_block_ids, shard_indexs, total_ptrs)
                 request_to_task[request_id] = task
             except RuntimeError as e:
                 logger.error(f"request {request_id} submit load task error. {e}")
@@ -612,22 +638,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     "load_speed": load_speed,
                 }
             )
-
-        if is_load == True and torch.distributed.get_rank() == 0:
-            layer_name = "model.layers.0.linear_attn"
-            print("---------------------[load]self.kv_caches[model.layers.44.linear_attn][1]:-------------------------")
-            print(self.kv_caches[layer_name][0][1])
-            print("---------------------[load]self.kv_caches[model.layers.44.linear_attn][15]:-------------------------")
-            print(self.kv_caches[layer_name][0][15])
-
-            layer_name = "model.layers.47.self_attn.attn"
-            print("---------------------[load]self.kv_caches[model.layers.47.self_attn.attn][4]:-------------------------\n")
-            print("\n")
-            print(self.kv_caches[layer_name][0][4])
-            layer_name = "model.layers.47.self_attn.attn"
-            print("---------------------[load]self.kv_caches[model.layers.47.self_attn.attn][18]:-------------------------\n")
-            print(self.kv_caches[layer_name][0][18])
-            
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -669,15 +679,14 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             total_vllm_block_ids.extend(vllm_block_ids)
 
         if is_save:
-            logger.info(
-                f"[UCM save] total ucm_ids={[b.hex() for b in total_ucm_block_ids]}, total vllm_block_ids={total_vllm_block_ids}"
-            )
+            total_ptrs = self.kv_cache_layout.extract_block_addrs(total_vllm_block_ids, False)
+            total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
             shard_indexs = [0] * len(total_ucm_block_ids)
             try:
                 self.synchronize()
                 save_start_time = time.perf_counter() * 1000
                 task = self.store.dump_data(
-                    total_ucm_block_ids, shard_indexs, self.kv_cache_layout.extract_base_addrs(total_vllm_block_ids)
+                    total_ucm_block_ids, shard_indexs, total_ptrs
                 )
                 dump_tasks.append(task)
             except RuntimeError as e:
@@ -738,9 +747,14 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                              load l2    -> forward l2 -> save l2
     """
 
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config, role)
-        self.load_tasks: dict[str, dict[str, Task]] = defaultdict(dict)
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+    ):
+        super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
+        self.load_tasks: dict[str, dict[int, Task]] = defaultdict(dict)
         self.dump_tasks: dict[str, Task] = {}
         self.use_layerwise = True
         self.is_save = False
@@ -933,7 +947,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
                 "use_layerwise", False
             )
         ):
-            self.connector = UCMLayerWiseConnector(vllm_config, role)
+            self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
         else:
             self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
 
