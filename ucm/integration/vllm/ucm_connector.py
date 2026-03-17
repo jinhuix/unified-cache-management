@@ -314,6 +314,15 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             ret.append(group_hash_list)
         return tuple(ret)
 
+    def _rank_hash20(self, ucm_block_id: bytes) -> bytes:
+        h = self.request_hasher(ucm_block_id)
+        suffix = (
+            ucm_block_id[16:20]
+            if len(ucm_block_id) >= 20
+            else (0).to_bytes(4, "big", signed=False)
+        )
+        return h + suffix
+
     def flatten_block_ids_by_group(
         self,
         block_ids_by_group: dict[int, list[Any]] | list[list[Any]] | tuple[list[Any], ...],
@@ -599,7 +608,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             ucm_block_ids, vllm_block_ids = request.load_block_ids
             if self.tp_rank != 0 and not self.is_mla:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+                    ucm_block_ids[i] = self._rank_hash20(ucm_block_id)
             total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids, True)
             total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
             shard_indexs = [0] * len(ucm_block_ids)
@@ -674,7 +683,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             ucm_block_ids, vllm_block_ids = request.dump_block_ids
             if self.tp_rank != 0:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+                    ucm_block_ids[i] = self._rank_hash20(ucm_block_id)
             total_ucm_block_ids.extend(ucm_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
 
